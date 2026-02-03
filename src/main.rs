@@ -78,6 +78,8 @@ struct AppState {
     status: String,
     last_refresh: SystemTime,
     modal: Modal,
+    info_extra: Vec<String>,
+    info_extra_visible: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +156,8 @@ fn init_state() -> anyhow::Result<AppState> {
         status: String::new(),
         last_refresh: SystemTime::now(),
         modal: Modal::None,
+        info_extra: Vec::new(),
+        info_extra_visible: false,
     };
     rebuild_entries(&mut state);
     Ok(state)
@@ -176,6 +180,8 @@ fn rebuild_entries(state: &mut AppState) {
     } else {
         state.table_state.select(None);
     }
+    state.info_extra.clear();
+    state.info_extra_visible = false;
 }
 
 fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
@@ -270,8 +276,14 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
                     opts,
                     field: 0,
                 };
+                }
             }
         }
+        KeyCode::Char('i') => {
+            if let Some(entry) = state.entries.get(state.selected) {
+                state.info_extra = device_info_lines(entry);
+                state.info_extra_visible = !state.info_extra_visible;
+            }
         }
         _ => {}
     }
@@ -302,6 +314,7 @@ fn handle_mouse(state: &mut AppState, mouse: crossterm::event::MouseEvent) {
                 let row_index = (mouse.row - body_start) as usize;
                 state.selected = row_index;
                 state.table_state.select(Some(state.selected));
+                update_info_extra_on_selection(state);
             }
         }
         _ => {}
@@ -584,6 +597,21 @@ fn render_details(state: &AppState) -> Paragraph<'static> {
             "Removable: {}",
             if entry.removable { "yes" } else { "no" }
         )));
+        let hint = if state.info_extra_visible {
+            "Press i to hide extra info"
+        } else {
+            "Press i to show extra info"
+        };
+        lines.push(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        if state.info_extra_visible {
+            for line in &state.info_extra {
+                lines.push(Line::from(line.clone()));
+            }
+        }
     } else {
         lines.push(Line::from("No selection"));
     }
@@ -753,6 +781,7 @@ fn select_prev(state: &mut AppState, n: usize) {
     }
     state.selected = state.selected.saturating_sub(n);
     state.table_state.select(Some(state.selected));
+    update_info_extra_on_selection(state);
 }
 
 fn select_next(state: &mut AppState, n: usize) {
@@ -761,6 +790,7 @@ fn select_next(state: &mut AppState, n: usize) {
     }
     state.selected = (state.selected + n).min(state.entries.len() - 1);
     state.table_state.select(Some(state.selected));
+    update_info_extra_on_selection(state);
 }
 
 fn select_first(state: &mut AppState) {
@@ -769,6 +799,7 @@ fn select_first(state: &mut AppState) {
     }
     state.selected = 0;
     state.table_state.select(Some(state.selected));
+    update_info_extra_on_selection(state);
 }
 
 fn select_last(state: &mut AppState) {
@@ -777,6 +808,7 @@ fn select_last(state: &mut AppState) {
     }
     state.selected = state.entries.len() - 1;
     state.table_state.select(Some(state.selected));
+    update_info_extra_on_selection(state);
 }
 
 fn toggle_span(label: &str, enabled: bool) -> Span<'static> {
@@ -829,6 +861,16 @@ fn footer_action_span(key: &str, label: &str, enabled: bool) -> Span<'static> {
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
         )
+    }
+}
+
+fn update_info_extra_on_selection(state: &mut AppState) {
+    if state.info_extra_visible {
+        if let Some(entry) = state.entries.get(state.selected) {
+            state.info_extra = device_info_lines(entry);
+        } else {
+            state.info_extra.clear();
+        }
     }
 }
 
@@ -1091,6 +1133,84 @@ fn default_mount_target(source: &str) -> String {
 
 fn is_root() -> bool {
     return Uid::current().is_root();
+}
+
+fn device_info_lines(entry: &UiEntry) -> Vec<String> {
+    let mut out = Vec::new();
+    let dev_path = entry_device_path(entry);
+    out.push(format!("Device: {}", dev_path));
+    if let Some(label) = find_label_for_device(&dev_path) {
+        out.push(format!("Label: {}", label));
+    }
+    if let Some(fstype) = default_fstype(&dev_path) {
+        out.push(format!("FS Type: {}", fstype));
+        let encrypted = fstype == "crypto_LUKS";
+        if encrypted {
+            out.push("Encrypted: yes (LUKS)".to_string());
+        }
+    }
+
+    if let Some(data) = udev_data_for_device(&dev_path) {
+        let keys = [
+            "ID_FS_LABEL",
+            "ID_FS_UUID",
+            "ID_FS_USAGE",
+            "ID_FS_VERSION",
+            "ID_PART_ENTRY_NAME",
+            "ID_PART_ENTRY_UUID",
+            "ID_PART_ENTRY_TYPE",
+            "ID_MODEL",
+            "ID_VENDOR",
+            "ID_SERIAL_SHORT",
+        ];
+        for key in keys {
+            if let Some(val) = data.get(key) {
+                out.push(format!("{}: {}", key, val));
+            }
+        }
+        if let Some(usage) = data.get("ID_FS_USAGE") {
+            if usage == "crypto" && !out.iter().any(|l| l.starts_with("Encrypted:")) {
+                out.push("Encrypted: yes".to_string());
+            }
+        }
+    } else {
+        out.push("udev: no info".to_string());
+    }
+
+    if out.len() == 1 {
+        out.push("No extra info available".to_string());
+    }
+    out
+}
+
+fn entry_device_path(entry: &UiEntry) -> String {
+    if entry.source.starts_with("/dev/") {
+        return entry.source.clone();
+    }
+    let token = entry
+        .name
+        .split_whitespace()
+        .next()
+        .unwrap_or(&entry.name);
+    format!("/dev/{}", token)
+}
+
+fn udev_data_for_device(dev_path: &str) -> Option<HashMap<String, String>> {
+    let dev_name = canonical_device_name(dev_path)?;
+    let dev_file = format!("/sys/class/block/{}/dev", dev_name);
+    let dev_id = fs::read_to_string(dev_file).ok()?;
+    let dev_id = dev_id.trim();
+    let udev_path = format!("/run/udev/data/b{}", dev_id);
+    let data = fs::read_to_string(udev_path).ok()?;
+    let mut map = HashMap::new();
+    for line in data.lines() {
+        if let Some(rest) = line.strip_prefix("E:") {
+            if let Some((k, v)) = rest.split_once('=') {
+                map.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    Some(map)
 }
 
 fn default_fstype(dev_path: &str) -> Option<String> {
