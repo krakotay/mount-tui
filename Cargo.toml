@@ -1,8 +1,10 @@
 [package]
 name = "mount-tui"
-version = "0.1.0"
+description = "Just a small TUI tool to mount"
+version = "0.2.0"
 edition = "2024"
-
+license = "Apache-2.0"
+authors = ["krakotay"]
 [dependencies]
 anyhow = "1.0.100"
 thiserror = "2.0.18"
