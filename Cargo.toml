@@ -1,0 +1,12 @@
+[package]
+name = "mount-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+thiserror = "2.0.18"
+crossterm = "0.29.0"
+nix = { version = "0.31.1", features = ["mount", "user"] }
+ratatui = "0.30.0"
+serde = { version = "1.0.228", features = ["derive"] }
