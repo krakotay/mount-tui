@@ -1,14 +1,14 @@
 [package]
 name = "mount-tui"
 description = "Just a small TUI tool to mount"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["krakotay"]
 [dependencies]
-anyhow = "1.0.100"
-thiserror = "2.0.18"
+anyhow = "1.0.104"
+thiserror = "2.0.19"
 crossterm = "0.29.0"
-nix = { version = "0.31.1", features = ["mount", "user"] }
-ratatui = "0.30.0"
-serde = { version = "1.0.228", features = ["derive"] }
+nix = { version = "0.31.3", features = ["mount", "user"] }
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }

@@ -3,4 +3,7 @@
 
 pub mod mountmgr;
 
-pub use mountmgr::{BlockDevice, MountEntry, MountError, MountManager};
+pub use mountmgr::{
+    BlockDevice, MountEntry, MountError, MountManager, UserAccessMethod, is_smb_fstype,
+    ownership_options, uses_mount_ownership,
+};

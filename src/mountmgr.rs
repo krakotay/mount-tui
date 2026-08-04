@@ -1,8 +1,14 @@
 use nix::errno::Errno;
 use nix::mount::{MsFlags, mount as nix_mount};
 use std::fs;
+use std::fs::OpenOptions;
 use std::io;
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::process::Command;
+use std::{ffi::CString, path::PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +42,8 @@ pub enum MountError {
     Parse(String),
     #[error("Other: {0}")]
     Other(String),
+    #[error("{program} failed: {message}")]
+    Command { program: String, message: String },
 }
 
 /// Небольшой менеджер монтирования
@@ -103,14 +111,123 @@ impl MountManager {
 
         // nix::mount::mount accepts Option<&Path> or Option<&str> that implement NixPath.
         // data param is Option<&str> — pass opts.
-        nix_mount(Some(source), target, fstype, flags, opts).map_err(|e| MountError::Nix(e))
+        nix_mount(Some(source), target, fstype, flags, opts).map_err(MountError::Nix)
+    }
+
+    /// Mount an SMB share through mount.cifs(8).  The helper is deliberately
+    /// invoked instead of the mount(2) syscall because it also resolves server
+    /// names and prepares CIFS-specific kernel options.
+    ///
+    /// Credentials are passed in a short-lived, mode 0600 file and never as a
+    /// command-line argument (where they would be visible through `ps`).
+    pub fn mount_smb(
+        source: &str,
+        target: &str,
+        username: Option<&str>,
+        password: Option<&str>,
+        domain: Option<&str>,
+        opts: Option<&str>,
+    ) -> Result<(), MountError> {
+        let source = normalize_smb_source(source)?;
+        ensure_mount_target(target)?;
+        let (options, credentials) = prepare_smb_options(username, password, domain, opts)?;
+        let result = mount_cifs_with_options(&source, target, &options);
+        drop(credentials);
+        result
+    }
+
+    /// Reconnect an existing SMB mount with credentials entered in the TUI.
+    /// This avoids mount.cifs opening `/dev/tty` for its own password prompt,
+    /// which is incompatible with the application's raw terminal mode.
+    pub fn reconnect_smb(
+        source: &str,
+        target: &str,
+        username: Option<&str>,
+        password: Option<&str>,
+        domain: Option<&str>,
+        opts: Option<&str>,
+        previous_options: &[String],
+    ) -> Result<(), MountError> {
+        let source = normalize_smb_source(source)?;
+        ensure_mount_target(target)?;
+        let (options, credentials) = prepare_smb_options(username, password, domain, opts)?;
+        let authentication = options
+            .iter()
+            .find(|option| option.starts_with("credentials=") || option.as_str() == "guest")
+            .cloned();
+        let mut rollback_options = reusable_smb_options(previous_options);
+        if let Some(authentication) = authentication {
+            rollback_options.push(authentication);
+        }
+
+        Self::umount(target)?;
+        let result = mount_cifs_with_options(&source, target, &options);
+        if let Err(error) = result {
+            let rollback = mount_cifs_with_options(&source, target, &rollback_options);
+            let rollback_message = match rollback {
+                Ok(()) => "the original mount options were restored".to_string(),
+                Err(rollback_error) => format!("restore also failed: {rollback_error}"),
+            };
+            drop(credentials);
+            return Err(MountError::Other(format!(
+                "SMB reconnect failed: {error}; {rollback_message}"
+            )));
+        }
+        drop(credentials);
+        Ok(())
+    }
+
+    /// Give the invoking desktop user access to a mounted local filesystem.
+    /// Filesystems with synthetic ownership are reconnected with uid/gid. On
+    /// Unix-native filesystems the mount root itself is chowned; existing child
+    /// entries keep their ownership and permissions. SMB must use
+    /// `reconnect_smb`, because reconnecting it requires credentials.
+    pub fn make_user_accessible(
+        source: &str,
+        target: &str,
+        fstype: &str,
+        current_options: &[String],
+        uid: u32,
+        gid: u32,
+    ) -> Result<UserAccessMethod, MountError> {
+        ensure_mount_target(target)?;
+        if is_smb_fstype(fstype) {
+            return Err(MountError::Other(
+                "SMB access changes require reconnect_smb with credentials".to_string(),
+            ));
+        }
+        if uses_mount_ownership(fstype) {
+            let updated_options = replace_ownership_options(current_options, fstype, uid, gid);
+            Self::umount(target)?;
+            if let Err(error) = mount_with_helper(source, target, fstype, &updated_options) {
+                let rollback = mount_with_helper(source, target, fstype, current_options);
+                let rollback_message = match rollback {
+                    Ok(()) => "the original mount was restored".to_string(),
+                    Err(rollback_error) => format!("restore also failed: {rollback_error}"),
+                };
+                return Err(MountError::Other(format!(
+                    "mount with user ownership failed: {error}; {rollback_message}"
+                )));
+            }
+            Ok(UserAccessMethod::Reconnected)
+        } else {
+            let target = CString::new(Path::new(target).as_os_str().as_bytes())
+                .map_err(|_| MountError::Other("mount target contains a NUL byte".to_string()))?;
+            // SAFETY: `target` is a valid, NUL-terminated path and remains alive
+            // for the duration of the libc call.
+            let result = unsafe { nix::libc::chown(target.as_ptr(), uid, gid) };
+            if result == -1 {
+                return Err(MountError::Io(io::Error::last_os_error()));
+            }
+            Ok(UserAccessMethod::ChangedOwner)
+        }
     }
 
     /// Отмонтировать (обычное umount). Для форсированного отмонтирования можно вызвать umount2 с флагами,
     /// но здесь — простая обёртка над libc umount/umount2 не реализована; используем nix::mount::umount.
     pub fn umount(target: &str) -> Result<(), MountError> {
         // nix exposes umount
-        nix::mount::umount(target).map_err(|e| MountError::Nix(e))
+        nix::mount::umount(target).map_err(MountError::Nix)
     }
 
     /// Список блочных устройств через /sys/class/block.
@@ -149,6 +266,287 @@ impl MountManager {
             });
         }
         Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserAccessMethod {
+    Reconnected,
+    ChangedOwner,
+}
+
+pub fn is_smb_fstype(fstype: &str) -> bool {
+    matches!(fstype, "cifs" | "smb3")
+}
+
+pub fn uses_mount_ownership(fstype: &str) -> bool {
+    matches!(
+        fstype,
+        "cifs" | "smb3" | "vfat" | "exfat" | "ntfs" | "ntfs3"
+    )
+}
+
+pub fn ownership_options(fstype: &str, uid: u32, gid: u32) -> String {
+    if is_smb_fstype(fstype) {
+        format!("uid={uid},gid={gid},forceuid,forcegid,file_mode=0664,dir_mode=0775")
+    } else {
+        format!("uid={uid},gid={gid},umask=022")
+    }
+}
+
+fn replace_ownership_options(
+    current_options: &[String],
+    fstype: &str,
+    uid: u32,
+    gid: u32,
+) -> Vec<String> {
+    let mut options: Vec<String> = current_options
+        .iter()
+        .filter(|option| {
+            let key = option
+                .split_once('=')
+                .map_or(option.as_str(), |(key, _)| key);
+            !matches!(key, "uid" | "gid" | "umask" | "fmask" | "dmask")
+        })
+        .cloned()
+        .collect();
+    options.extend(
+        ownership_options(fstype, uid, gid)
+            .split(',')
+            .map(str::to_string),
+    );
+    options
+}
+
+fn mount_with_helper(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    options: &[String],
+) -> Result<(), MountError> {
+    let mut command = Command::new("mount");
+    command.args(["-t", fstype, source, target]);
+    if !options.is_empty() {
+        command.args(["-o", &options.join(",")]);
+    }
+    run_command(command, "mount")
+}
+
+fn prepare_smb_options(
+    username: Option<&str>,
+    password: Option<&str>,
+    domain: Option<&str>,
+    opts: Option<&str>,
+) -> Result<(Vec<String>, Option<CredentialFile>), MountError> {
+    for (name, value) in [
+        ("username", username),
+        ("password", password),
+        ("domain", domain),
+    ] {
+        if value.is_some_and(|value| value.contains(['\n', '\r'])) {
+            return Err(MountError::Other(format!(
+                "SMB {name} must not contain a newline"
+            )));
+        }
+    }
+
+    let mut options = sanitized_smb_options(opts)?;
+    let has_username = username.is_some_and(|value| !value.is_empty());
+    if !has_username
+        && (password.is_some_and(|value| !value.is_empty())
+            || domain.is_some_and(|value| !value.is_empty()))
+    {
+        return Err(MountError::Other(
+            "SMB username is required when password or domain is set".to_string(),
+        ));
+    }
+    let credentials = if has_username {
+        options.retain(|option| option != "guest");
+        let credentials =
+            CredentialFile::create(username, Some(password.unwrap_or_default()), domain)?;
+        options.push(format!("credentials={}", credentials.path().display()));
+        Some(credentials)
+    } else {
+        if !options.iter().any(|option| option == "guest") {
+            options.push("guest".to_string());
+        }
+        None
+    };
+    Ok((options, credentials))
+}
+
+fn mount_cifs_with_options(
+    source: &str,
+    target: &str,
+    options: &[String],
+) -> Result<(), MountError> {
+    let mut command = Command::new("mount");
+    command.args(["-t", "cifs", source, target]);
+    if !options.is_empty() {
+        command.args(["-o", &options.join(",")]);
+    }
+    run_command(command, "mount -t cifs")
+}
+
+fn reusable_smb_options(options: &[String]) -> Vec<String> {
+    options
+        .iter()
+        .filter(|option| {
+            let key = option
+                .split_once('=')
+                .map_or(option.as_str(), |(key, _)| key);
+            !matches!(
+                key,
+                "password"
+                    | "pass"
+                    | "credentials"
+                    | "username"
+                    | "user"
+                    | "domain"
+                    | "workgroup"
+                    | "guest"
+                    | "unc"
+                    | "ip"
+                    | "addr"
+                    | "prefixpath"
+                    | "user_id"
+                    | "group_id"
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn ensure_mount_target(target: &str) -> Result<(), MountError> {
+    let path = Path::new(target);
+    if !path.exists() {
+        return Err(MountError::Other(format!(
+            "target path does not exist: {target}"
+        )));
+    }
+    if !path.is_dir() {
+        return Err(MountError::Other(format!(
+            "mount target is not a directory: {target}"
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_smb_source(source: &str) -> Result<String, MountError> {
+    let source = source.trim();
+    let normalized = source
+        .strip_prefix("smb://")
+        .map(|rest| format!("//{rest}"))
+        .unwrap_or_else(|| source.to_string());
+    let rest = normalized
+        .strip_prefix("//")
+        .ok_or_else(|| MountError::Other("SMB source must look like //server/share".to_string()))?;
+    let mut parts = rest.split('/').filter(|part| !part.is_empty());
+    if parts.next().is_none() || parts.next().is_none() {
+        return Err(MountError::Other(
+            "SMB source must include both server and share".to_string(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn sanitized_smb_options(opts: Option<&str>) -> Result<Vec<String>, MountError> {
+    let mut out = Vec::new();
+    for option in opts.unwrap_or_default().split(',') {
+        let option = option.trim();
+        if option.is_empty() || option == "defaults" {
+            continue;
+        }
+        let key = option.split_once('=').map_or(option, |(key, _)| key);
+        if matches!(
+            key,
+            "password" | "pass" | "credentials" | "username" | "user" | "domain" | "workgroup"
+        ) {
+            return Err(MountError::Other(format!(
+                "do not put {key}= in options; use the dedicated SMB form field"
+            )));
+        }
+        if !out.iter().any(|existing| existing == option) {
+            out.push(option.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn run_command(mut command: Command, program: &str) -> Result<(), MountError> {
+    let output = command.output().map_err(MountError::Io)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("exit status {}", output.status)
+    };
+    Err(MountError::Command {
+        program: program.to_string(),
+        message,
+    })
+}
+
+struct CredentialFile {
+    path: PathBuf,
+}
+
+impl CredentialFile {
+    fn create(
+        username: Option<&str>,
+        password: Option<&str>,
+        domain: Option<&str>,
+    ) -> Result<Self, MountError> {
+        let base = if Path::new("/run").is_dir() {
+            Path::new("/run")
+        } else {
+            Path::new("/tmp")
+        };
+        for attempt in 0..100u32 {
+            let path = base.join(format!(".mount-tui-cifs-{}-{attempt}", std::process::id()));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let credentials = Self { path };
+                    if let Some(username) = username.filter(|value| !value.is_empty()) {
+                        writeln!(file, "username={username}")?;
+                    }
+                    if let Some(password) = password {
+                        writeln!(file, "password={password}")?;
+                    }
+                    if let Some(domain) = domain.filter(|value| !value.is_empty()) {
+                        writeln!(file, "domain={domain}")?;
+                    }
+                    file.sync_all()?;
+                    return Ok(credentials);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(MountError::Io(error)),
+            }
+        }
+        Err(MountError::Other(
+            "could not create a temporary SMB credentials file".to_string(),
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for CredentialFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -208,5 +606,66 @@ mod tests {
     fn test_unescape() {
         assert_eq!(unescape_mount_field("foo\\040bar"), "foo bar");
         assert_eq!(unescape_mount_field("a\\040b\\011c"), "a b\tc");
+    }
+
+    #[test]
+    fn normalizes_smb_urls() {
+        assert_eq!(
+            normalize_smb_source("smb://nas/media").unwrap(),
+            "//nas/media"
+        );
+        assert_eq!(normalize_smb_source("//nas/media").unwrap(), "//nas/media");
+        assert!(normalize_smb_source("nas").is_err());
+        assert!(normalize_smb_source("//nas").is_err());
+    }
+
+    #[test]
+    fn rejects_secrets_in_mount_options() {
+        assert!(sanitized_smb_options(Some("rw,password=secret")).is_err());
+        assert!(sanitized_smb_options(Some("credentials=/tmp/file")).is_err());
+        assert!(sanitized_smb_options(Some("username=alice")).is_err());
+        assert_eq!(
+            sanitized_smb_options(Some("defaults,rw,rw,nodev")).unwrap(),
+            ["rw", "nodev"]
+        );
+    }
+
+    #[test]
+    fn ownership_options_match_filesystem_semantics() {
+        assert_eq!(
+            ownership_options("cifs", 1000, 100),
+            "uid=1000,gid=100,forceuid,forcegid,file_mode=0664,dir_mode=0775"
+        );
+        assert_eq!(
+            ownership_options("vfat", 1000, 100),
+            "uid=1000,gid=100,umask=022"
+        );
+    }
+
+    #[test]
+    fn replaces_existing_ownership_options() {
+        let existing = vec![
+            "rw".to_string(),
+            "uid=0".to_string(),
+            "gid=0".to_string(),
+            "fmask=0177".to_string(),
+            "iocharset=utf8".to_string(),
+        ];
+        assert_eq!(
+            replace_ownership_options(&existing, "vfat", 1000, 100),
+            ["rw", "iocharset=utf8", "uid=1000", "gid=100", "umask=022"]
+        );
+    }
+
+    #[test]
+    fn reusable_smb_options_remove_authentication_and_kernel_generated_values() {
+        let existing = vec![
+            "rw".to_string(),
+            "username=alice".to_string(),
+            "credentials=/run/secret".to_string(),
+            "addr=192.0.2.1".to_string(),
+            "vers=3.1.1".to_string(),
+        ];
+        assert_eq!(reusable_smb_options(&existing), ["rw", "vers=3.1.1"]);
     }
 }
