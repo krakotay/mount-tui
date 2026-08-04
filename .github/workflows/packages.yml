@@ -1,0 +1,106 @@
+name: Build packages
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-linux-x86_64:
+    name: Build DEB, RPM and raw binary
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Select stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - name: Install packaging tools
+        run: |
+          cargo install cargo-deb --version 3.7.0 --locked
+          cargo install cargo-generate-rpm --version 0.21.0 --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Read package metadata
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_name="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')"
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          rust_target="$(rustc -vV | sed -n 's/^host: //p')"
+          deb_arch="$(dpkg --print-architecture)"
+          rpm_arch="$(uname -m)"
+          stem="${package_name}-${package_version}"
+
+          echo "name=${package_name}" >> "$GITHUB_OUTPUT"
+          echo "version=${package_version}" >> "$GITHUB_OUTPUT"
+          echo "raw=${stem}-${rust_target}" >> "$GITHUB_OUTPUT"
+          echo "deb=${stem}-${deb_arch}.deb" >> "$GITHUB_OUTPUT"
+          echo "rpm=${stem}-${rpm_arch}.rpm" >> "$GITHUB_OUTPUT"
+
+      - name: Create raw binary artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          install -m 0755 \
+            "target/release/${{ steps.package.outputs.name }}" \
+            "dist/${{ steps.package.outputs.raw }}"
+
+      - name: Build Debian package
+        run: >-
+          cargo deb --no-build --locked
+          --output "dist/${{ steps.package.outputs.deb }}"
+
+      - name: Build RPM package
+        run: >-
+          cargo generate-rpm
+          --output "dist/${{ steps.package.outputs.rpm }}"
+
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "dist/${{ steps.package.outputs.raw }}"
+          dpkg-deb --info "dist/${{ steps.package.outputs.deb }}"
+          test -s "dist/${{ steps.package.outputs.rpm }}"
+
+      - name: Upload raw binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.raw }}
+          path: dist/${{ steps.package.outputs.raw }}
+          if-no-files-found: error
+          archive: false
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.deb }}
+          path: dist/${{ steps.package.outputs.deb }}
+          if-no-files-found: error
+          archive: false
+
+      - name: Upload RPM package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.rpm }}
+          path: dist/${{ steps.package.outputs.rpm }}
+          if-no-files-found: error
+          archive: false

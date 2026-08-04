@@ -5,6 +5,27 @@ version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["krakotay"]
+repository = "https://github.com/krakotay/mount-tui"
+readme = "README.md"
+
+[package.metadata.deb]
+section = "utils"
+priority = "optional"
+depends = "$auto, cifs-utils"
+assets = [
+    ["target/release/mount-tui", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/mount-tui/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/mount-tui", dest = "/usr/bin/mount-tui", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/mount-tui/README.md", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+cifs-utils = "*"
+
 [dependencies]
 anyhow = "1.0.104"
 thiserror = "2.0.19"
