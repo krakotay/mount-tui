@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: packages-${{ github.ref }}
@@ -104,3 +104,35 @@ jobs:
           path: dist/${{ steps.package.outputs.rpm }}
           if-no-files-found: error
           archive: false
+
+      - name: Create or update GitHub Release
+        if: >-
+          github.event_name == 'workflow_dispatch' ||
+          github.ref_name == github.event.repository.default_branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v${{ steps.package.outputs.version }}
+          RELEASE_TITLE: ${{ steps.package.outputs.name }} ${{ steps.package.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$RELEASE_TITLE"
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TITLE" \
+              --generate-notes
+          fi
+
+          gh release upload "$RELEASE_TAG" \
+            "dist/${{ steps.package.outputs.raw }}" \
+            "dist/${{ steps.package.outputs.deb }}" \
+            "dist/${{ steps.package.outputs.rpm }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
