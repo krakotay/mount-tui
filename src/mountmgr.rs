@@ -1,10 +1,8 @@
-use nix::errno::Errno;
-use nix::mount::{MsFlags, mount as nix_mount};
+use rustix::mount::{MountFlags, UnmountFlags};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Command;
@@ -39,8 +37,8 @@ pub struct BlockDevice {
 pub enum MountError {
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
-    #[error("Nix error: {0}")]
-    Nix(#[from] Errno),
+    #[error("System error: {0}")]
+    System(#[from] rustix::io::Errno),
     #[error("Parse error: {0}")]
     Parse(String),
     #[error("Other: {0}")]
@@ -101,7 +99,7 @@ impl MountManager {
         target: &str,
         fstype: Option<&str>,
         opts: Option<&str>,
-        flags: MsFlags,
+        flags: MountFlags,
     ) -> Result<(), MountError> {
         // ensure target exists
         let p = Path::new(target);
@@ -124,9 +122,24 @@ impl MountManager {
             return mount_with_helper(source, target, "ntfs-3g", &options);
         }
 
-        // nix::mount::mount accepts Option<&Path> or Option<&str> that implement NixPath.
-        // data param is Option<&str> — pass opts.
-        nix_mount(Some(source), target, fstype, flags, opts).map_err(MountError::Nix)
+        let Some(fstype) = fstype else {
+            // The mount syscall does not auto-detect filesystems. Delegate an
+            // unspecified type to mount(8), which performs the expected probe.
+            let options = opts
+                .unwrap_or_default()
+                .split(',')
+                .filter(|option| !option.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            return mount_with_helper(source, target, "auto", &options);
+        };
+        let data = opts
+            .filter(|options| !options.is_empty())
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| MountError::Other("mount options contain a NUL byte".to_string()))?;
+        rustix::mount::mount(source, target, fstype, flags, data.as_deref())?;
+        Ok(())
     }
 
     /// Mount an SMB share through mount.cifs(8).  The helper is deliberately
@@ -226,23 +239,19 @@ impl MountManager {
             }
             Ok(UserAccessMethod::Reconnected)
         } else {
-            let target = CString::new(Path::new(target).as_os_str().as_bytes())
-                .map_err(|_| MountError::Other("mount target contains a NUL byte".to_string()))?;
-            // SAFETY: `target` is a valid, NUL-terminated path and remains alive
-            // for the duration of the libc call.
-            let result = unsafe { nix::libc::chown(target.as_ptr(), uid, gid) };
-            if result == -1 {
-                return Err(MountError::Io(io::Error::last_os_error()));
-            }
+            rustix::fs::chown(
+                target,
+                Some(rustix::process::Uid::from_raw(uid)),
+                Some(rustix::process::Gid::from_raw(gid)),
+            )?;
             Ok(UserAccessMethod::ChangedOwner)
         }
     }
 
-    /// Отмонтировать (обычное umount). Для форсированного отмонтирования можно вызвать umount2 с флагами,
-    /// но здесь — простая обёртка над libc umount/umount2 не реализована; используем nix::mount::umount.
+    /// Unmount a filesystem without force or lazy flags.
     pub fn umount(target: &str) -> Result<(), MountError> {
-        // nix exposes umount
-        nix::mount::umount(target).map_err(MountError::Nix)
+        rustix::mount::unmount(target, UnmountFlags::empty())?;
+        Ok(())
     }
 
     /// Список блочных устройств через /sys/class/block.

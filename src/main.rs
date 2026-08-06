@@ -9,7 +9,6 @@ use crossterm::{
 use mount_tui::{
     BlockDevice, MountEntry, MountManager, UserAccessMethod, is_smb_fstype, ownership_options,
 };
-use nix::unistd::Uid;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -57,6 +56,16 @@ struct UiEntry {
     model: Option<String>,
     vendor: Option<String>,
     options: Vec<String>,
+    ownership: Ownership,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+    Unmounted,
+    CurrentUser,
+    Other(u32),
+    Mixed,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +337,12 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
             if let Some(entry) = state.entries.get(state.selected) {
                 if entry.mount_points.is_empty() {
                     state.status = "Mount the filesystem first".to_string();
+                } else if entry.ownership == Ownership::CurrentUser {
+                    state.status = format!(
+                        "Already owned by {} ({})",
+                        effective_user_name(),
+                        effective_user_ids().0
+                    );
                 } else if effective_user_ids().0 == 0 {
                     state.status =
                         "No regular user detected; start mount-tui via sudo as that user"
@@ -352,8 +367,13 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
                         previous_mount,
                     };
                 } else {
+                    let mount_points = mount_points_needing_access(
+                        &state.mounts,
+                        &entry.mount_points,
+                        effective_user_ids().0,
+                    );
                     state.modal = Modal::UserAccess {
-                        mount_points: entry.mount_points.clone(),
+                        mount_points,
                         selected: 0,
                         fstype: entry.fstype.clone().unwrap_or_default(),
                     };
@@ -609,22 +629,30 @@ fn render_table(state: &AppState, _area: Rect) -> Table<'static> {
             };
             let fstype = e.fstype.clone().unwrap_or_else(|| "-".to_string());
             let kind = e.kind.clone();
+            let owner = ownership_label(e.ownership);
+            let owner_style = match e.ownership {
+                Ownership::CurrentUser => Style::default().fg(Color::Green),
+                Ownership::Other(_) | Ownership::Mixed => Style::default().fg(Color::Yellow),
+                Ownership::Unknown | Ownership::Unmounted => Style::default().fg(Color::DarkGray),
+            };
             Row::new(vec![
                 Cell::from(name),
                 Cell::from(kind),
                 Cell::from(size),
                 Cell::from(mount),
                 Cell::from(fstype),
+                Cell::from(owner).style(owner_style),
             ])
         })
         .collect();
 
     let widths = [
-        Constraint::Percentage(25),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Percentage(35),
         Constraint::Percentage(20),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Percentage(30),
+        Constraint::Percentage(15),
+        Constraint::Percentage(15),
     ];
 
     Table::new(rows, widths)
@@ -635,6 +663,7 @@ fn render_table(state: &AppState, _area: Rect) -> Table<'static> {
                 Cell::from("Size"),
                 Cell::from("Mount"),
                 Cell::from("FS"),
+                Cell::from("Owner"),
             ])
             .style(header_style)
             .bottom_margin(0),
@@ -669,6 +698,17 @@ fn render_details(state: &AppState) -> Paragraph<'static> {
         }
         if let Some(fs) = &entry.fstype {
             lines.push(Line::from(format!("FS: {}", fs)));
+        }
+        if !matches!(entry.ownership, Ownership::Unmounted) {
+            let style = match entry.ownership {
+                Ownership::CurrentUser => Style::default().fg(Color::Green),
+                Ownership::Other(_) | Ownership::Mixed => Style::default().fg(Color::Yellow),
+                Ownership::Unknown | Ownership::Unmounted => Style::default().fg(Color::DarkGray),
+            };
+            lines.push(Line::from(Span::styled(
+                format!("Owner: {}", ownership_label(entry.ownership)),
+                style,
+            )));
         }
         if !entry.options.is_empty() {
             let useful_options: Vec<&str> = entry
@@ -750,6 +790,7 @@ fn build_entries(
         let mut fstype = dev.fstype.clone();
         let mut source = dev.path.clone();
         let mut options = Vec::new();
+        let mut owner_uids = Vec::new();
 
         let match_keys = device_match_keys(dev);
         for key in match_keys {
@@ -761,6 +802,7 @@ fn build_entries(
                     fstype = Some(m.fstype.clone());
                     source = m.source.clone();
                     options = m.options.clone();
+                    owner_uids.push(mount_owner_uid(m));
                 }
             }
         }
@@ -783,6 +825,7 @@ fn build_entries(
             model: dev.model.clone(),
             vendor: dev.vendor.clone(),
             options,
+            ownership: ownership_from_uids(&owner_uids, effective_user_ids().0),
         });
     }
 
@@ -799,6 +842,7 @@ fn build_entries(
                 model: None,
                 vendor: None,
                 options: mount.options.clone(),
+                ownership: ownership_from_uids(&[mount_owner_uid(mount)], effective_user_ids().0),
             });
         }
     }
@@ -822,6 +866,7 @@ fn build_entries(
                 model: None,
                 vendor: None,
                 options: m.options.clone(),
+                ownership: ownership_from_uids(&[mount_owner_uid(m)], effective_user_ids().0),
             });
         }
     }
@@ -984,9 +1029,71 @@ fn update_info_extra_on_selection(state: &mut AppState) {
 fn selected_actions(state: &AppState) -> (bool, bool, bool) {
     if let Some(entry) = state.entries.get(state.selected) {
         let mounted = !entry.mount_points.is_empty();
-        (!mounted, mounted, mounted)
+        (
+            !mounted,
+            mounted,
+            mounted && entry.ownership != Ownership::CurrentUser,
+        )
     } else {
         (false, false, false)
+    }
+}
+
+fn mount_owner_uid(mount: &MountEntry) -> Option<u32> {
+    if mount_tui::uses_mount_ownership(&mount.fstype) {
+        // Synthetic-ownership filesystems default to root when no uid option
+        // is present. Avoid stat on a remote SMB share, which may block if its
+        // server is unavailable.
+        return mount_option_value(&mount.options, &["uid"])
+            .and_then(|uid| uid.parse().ok())
+            .or(Some(0));
+    }
+    rustix::fs::stat(&mount.target).ok().map(|stat| stat.st_uid)
+}
+
+fn mount_points_needing_access(
+    mounts: &[MountEntry],
+    mount_points: &[String],
+    current_uid: u32,
+) -> Vec<String> {
+    mount_points
+        .iter()
+        .filter(|target| {
+            mounts
+                .iter()
+                .find(|mount| mount.target == target.as_str())
+                .and_then(mount_owner_uid)
+                != Some(current_uid)
+        })
+        .cloned()
+        .collect()
+}
+
+fn ownership_from_uids(owner_uids: &[Option<u32>], current_uid: u32) -> Ownership {
+    if owner_uids.is_empty() {
+        return Ownership::Unmounted;
+    }
+    if owner_uids.iter().any(Option::is_none) {
+        return Ownership::Unknown;
+    }
+    let mut owners = owner_uids.iter().flatten();
+    let first = *owners.next().expect("non-empty owners checked above");
+    if owners.any(|uid| *uid != first) {
+        Ownership::Mixed
+    } else if first == current_uid {
+        Ownership::CurrentUser
+    } else {
+        Ownership::Other(first)
+    }
+}
+
+fn ownership_label(ownership: Ownership) -> String {
+    match ownership {
+        Ownership::Unmounted => "-".to_string(),
+        Ownership::CurrentUser => format!("you ({})", effective_user_ids().0),
+        Ownership::Other(uid) => format!("uid:{uid}"),
+        Ownership::Mixed => "mixed".to_string(),
+        Ownership::Unknown => "unknown".to_string(),
     }
 }
 
@@ -1087,9 +1194,9 @@ fn render_modal(f: &mut ratatui::Frame<'_>, state: &AppState, area: Rect) {
                 fstype_line,
                 form_line("Options", opts, *field == 3),
                 Line::from(if is_ntfs_driver(fstype) {
-                    "Select driver with Space or ←/→  Enter=next/confirm  Esc=cancel"
+                    "↑/↓/Tab: field  Space or ←/→: driver  Enter: next/mount  Esc: cancel"
                 } else {
-                    "Enter=next/confirm  Tab=next  Esc=cancel"
+                    "↑/↓/Tab/Shift+Tab: field  Enter: next/mount  Esc: cancel"
                 }),
             ];
             let widget = Paragraph::new(lines)
@@ -1378,9 +1485,14 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
             KeyCode::Tab => {
                 *field = (*field + 1) % 4;
             }
-            KeyCode::BackTab => {
+            KeyCode::BackTab | KeyCode::Up => {
                 *field = field.saturating_sub(1);
             }
+            KeyCode::Down => {
+                *field = (*field + 1).min(3);
+            }
+            KeyCode::Home => *field = 0,
+            KeyCode::End => *field = 3,
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if *field == 2 && is_ntfs_driver(fstype) =>
             {
@@ -1390,9 +1502,9 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
                 if *field < 3 {
                     *field += 1;
                 } else {
-                    let mut flags = nix::mount::MsFlags::empty();
+                    let mut flags = rustix::mount::MountFlags::empty();
                     if opts.split(',').any(|x| x == "ro") {
-                        flags |= nix::mount::MsFlags::MS_RDONLY;
+                        flags |= rustix::mount::MountFlags::RDONLY;
                     }
                     if !Path::new(target.as_str()).exists()
                         && let Err(e) = fs::create_dir_all(target.as_str())
@@ -1786,7 +1898,7 @@ fn default_mount_target(source: &str) -> String {
 }
 
 fn is_root() -> bool {
-    Uid::current().is_root()
+    rustix::process::geteuid().is_root()
 }
 
 fn device_info_lines(entry: &UiEntry) -> Vec<String> {
@@ -1965,20 +2077,15 @@ fn effective_user_ids() -> (u32, u32) {
         .or_else(|| {
             env::var("DOAS_USER")
                 .ok()
-                .and_then(|name| nix::unistd::User::from_name(&name).ok().flatten())
-                .map(|user| user.uid.as_raw())
+                .and_then(|name| passwd_entry_by_name(&name))
+                .map(|(_, uid, _)| uid)
         })
-        .unwrap_or_else(|| unsafe { nix::libc::getuid() as u32 });
+        .unwrap_or_else(|| rustix::process::getuid().as_raw());
     let gid = env::var("SUDO_GID")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .or_else(|| {
-            nix::unistd::User::from_uid(Uid::from_raw(uid))
-                .ok()
-                .flatten()
-                .map(|user| user.gid.as_raw())
-        })
-        .unwrap_or_else(|| unsafe { nix::libc::getgid() as u32 });
+        .or_else(|| passwd_entry_by_uid(uid).map(|(_, _, gid)| gid))
+        .unwrap_or_else(|| rustix::process::getgid().as_raw());
     (uid, gid)
 }
 
@@ -1991,12 +2098,34 @@ fn effective_user_name() -> String {
         }
     }
     let (uid, _) = effective_user_ids();
-    nix::unistd::User::from_uid(Uid::from_raw(uid))
-        .ok()
-        .flatten()
-        .map(|user| user.name)
+    passwd_entry_by_uid(uid)
+        .map(|(name, _, _)| name)
         .or_else(|| env::var("USER").ok())
         .unwrap_or_else(|| uid.to_string())
+}
+
+fn passwd_entries() -> impl Iterator<Item = (String, u32, u32)> {
+    fs::read_to_string("/etc/passwd")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(':');
+            let name = fields.next()?.to_string();
+            fields.next()?;
+            let uid = fields.next()?.parse().ok()?;
+            let gid = fields.next()?.parse().ok()?;
+            Some((name, uid, gid))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+fn passwd_entry_by_name(name: &str) -> Option<(String, u32, u32)> {
+    passwd_entries().find(|entry| entry.0 == name)
+}
+
+fn passwd_entry_by_uid(uid: u32) -> Option<(String, u32, u32)> {
+    passwd_entries().find(|entry| entry.1 == uid)
 }
 
 fn find_label_for_device(dev_path: &str) -> Option<String> {
@@ -2147,6 +2276,7 @@ mod tests {
                 "domain=OFFICE".to_string(),
                 "uid=0".to_string(),
             ],
+            ownership: Ownership::Other(0),
         };
 
         let (source, target, username, domain, options) = smb_reconnect_fields(&entry);
@@ -2182,5 +2312,20 @@ mod tests {
         );
         assert!(smb_form_error("smb://nas/share", "/mnt/share", "alice", "", "").is_none());
         assert!(smb_form_error("//nas/share", "/mnt/share", "", "", "").is_none());
+    }
+
+    #[test]
+    fn ownership_indicator_distinguishes_current_other_and_mixed_owners() {
+        assert_eq!(ownership_from_uids(&[], 1000), Ownership::Unmounted);
+        assert_eq!(
+            ownership_from_uids(&[Some(1000)], 1000),
+            Ownership::CurrentUser
+        );
+        assert_eq!(ownership_from_uids(&[Some(0)], 1000), Ownership::Other(0));
+        assert_eq!(
+            ownership_from_uids(&[Some(1000), Some(0)], 1000),
+            Ownership::Mixed
+        );
+        assert_eq!(ownership_from_uids(&[None], 1000), Ownership::Unknown);
     }
 }
