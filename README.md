@@ -101,7 +101,10 @@ an explicit `[x]` / `[ ]` selector and can be changed with `Space`, `←`, or `�
 Text fields have a visible cursor and support in-place editing with `←` / `→`,
 `Home` / `End`, `Backspace`, and `Delete`. If a read-write local mount fails,
 the application offers an interactive retry with the same options in read-only
-mode.
+mode. For the `ntfs3` driver, a failed read-write mount offers either read-only
+or a clearly marked, not-recommended `DANGER` retry using `force`. If that forced
+read-write attempt fails, read-only is offered; a failed ordinary read-only
+attempt offers a final `DANGER` read-only retry using `force`.
 
 ## SMB/CIFS
 

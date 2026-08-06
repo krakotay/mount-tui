@@ -112,7 +112,7 @@ enum Modal {
         field: usize,
         cursor: usize,
     },
-    ConfirmReadOnlyMount {
+    ConfirmMountRetry {
         source: String,
         target: String,
         fstype: String,
@@ -1174,29 +1174,46 @@ fn render_modal(f: &mut ratatui::Frame<'_>, state: &AppState, area: Rect) {
             f.render_widget(Clear, rect);
             f.render_widget(widget, rect);
         }
-        Modal::ConfirmReadOnlyMount {
+        Modal::ConfirmMountRetry {
             source,
             target,
             fstype,
             opts,
             error,
         } => {
-            let body = vec![
+            let retries = mount_retry_options(fstype, opts);
+            let has_force = retries.iter().any(|retry| retry.force);
+            let heading = if has_force {
+                "DANGER: force mount fallback available"
+            } else {
+                "Mount failed"
+            };
+            let mut body = vec![
                 Line::from(Span::styled(
-                    "Read-write mount failed",
+                    heading,
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(error.clone()),
                 Line::from(""),
-                Line::from(format!("Retry {source} on {target} as read-only?")),
-                Line::from(format!("Filesystem: {fstype}   Options: {opts}")),
-                Line::from("Enter=mount read-only  Esc=cancel"),
+                Line::from(format!("Retry {source} on {target}?")),
+                Line::from(format!("Filesystem: {fstype}   Failed options: {opts}")),
+                Line::from(retry_prompt(&retries)),
             ];
+            if has_force {
+                body.push(Line::from(Span::styled(
+                    "DANGER: force can damage the filesystem and is not recommended.",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )));
+            }
             let widget = Paragraph::new(body)
                 .wrap(ratatui::widgets::Wrap { trim: false })
                 .block(
                     Block::default()
-                        .title("Read-only fallback")
+                        .title(if has_force {
+                            "DANGER: force mount fallback"
+                        } else {
+                            "Mount fallback"
+                        })
                         .borders(Borders::ALL),
                 );
             f.render_widget(Clear, rect);
@@ -1574,12 +1591,12 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
                         }
                         Err(e) => {
                             state.status = format!("mount failed: {e}");
-                            if !mount_options_are_read_only(opts) {
-                                state.modal = Modal::ConfirmReadOnlyMount {
+                            if !mount_retry_options(fstype, opts).is_empty() {
+                                state.modal = Modal::ConfirmMountRetry {
                                     source: source.clone(),
                                     target: target.clone(),
                                     fstype: fstype.clone(),
-                                    opts: read_only_mount_options(opts),
+                                    opts: opts.clone(),
                                     error: e.to_string(),
                                 };
                                 return Ok(false);
@@ -1614,7 +1631,7 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
             }
             _ => {}
         },
-        Modal::ConfirmReadOnlyMount {
+        Modal::ConfirmMountRetry {
             source,
             target,
             fstype,
@@ -1622,7 +1639,17 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
             error: _,
         } => match key.code {
             KeyCode::Esc => state.modal = Modal::None,
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char('f' | 'F') => {
+                let retries = mount_retry_options(fstype, opts);
+                let selected = match key.code {
+                    KeyCode::Char('f' | 'F') => retries.iter().find(|retry| retry.force),
+                    _ => retries.iter().find(|retry| !retry.force),
+                };
+                let Some(selected) = selected else {
+                    return Ok(false);
+                };
+                let retry_opts = selected.options.clone();
+                let retry_label = selected.label;
                 let mounted_target = target.clone();
                 match MountManager::mount(
                     source,
@@ -1632,20 +1659,31 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
                     } else {
                         Some(fstype.as_str())
                     },
-                    Some(opts.as_str()),
+                    Some(retry_opts.as_str()),
                     rustix::mount::MountFlags::empty(),
                 ) {
                     Ok(()) => {
                         state.mounts = MountManager::list_mounts().unwrap_or_default();
                         state.devices = MountManager::list_block_devices().unwrap_or_default();
                         rebuild_entries(state);
-                        state.status = format!("Mounted {mounted_target} read-only");
+                        state.status = format!("Mounted {mounted_target} {retry_label}");
+                        state.modal = Modal::None;
                     }
                     Err(error) => {
-                        state.status = format!("read-only mount failed: {error}");
+                        state.status = format!("{retry_label} mount failed: {error}");
+                        if mount_retry_options(fstype, &retry_opts).is_empty() {
+                            state.modal = Modal::None;
+                        } else {
+                            state.modal = Modal::ConfirmMountRetry {
+                                source: source.clone(),
+                                target: target.clone(),
+                                fstype: fstype.clone(),
+                                opts: retry_opts,
+                                error: error.to_string(),
+                            };
+                        }
                     }
                 }
-                state.modal = Modal::None;
             }
             _ => {}
         },
@@ -1891,6 +1929,10 @@ fn mount_options_are_read_only(options: &str) -> bool {
     options.split(',').any(|option| option.trim() == "ro")
 }
 
+fn mount_options_are_forced(options: &str) -> bool {
+    options.split(',').any(|option| option.trim() == "force")
+}
+
 fn read_only_mount_options(options: &str) -> String {
     std::iter::once("ro")
         .chain(
@@ -1901,6 +1943,89 @@ fn read_only_mount_options(options: &str) -> String {
         )
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn force_mount_options(options: &str) -> String {
+    std::iter::once("force")
+        .chain(
+            options
+                .split(',')
+                .map(str::trim)
+                .filter(|option| !option.is_empty() && *option != "force"),
+        )
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn without_force_mount_options(options: &str) -> String {
+    options
+        .split(',')
+        .map(str::trim)
+        .filter(|option| !option.is_empty() && *option != "force")
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MountRetry {
+    label: &'static str,
+    options: String,
+    force: bool,
+}
+
+fn mount_retry_options(fstype: &str, failed_options: &str) -> Vec<MountRetry> {
+    let read_only = mount_options_are_read_only(failed_options);
+    let forced = mount_options_are_forced(failed_options);
+
+    if fstype != "ntfs3" {
+        return (!read_only)
+            .then(|| MountRetry {
+                label: "read-only",
+                options: read_only_mount_options(failed_options),
+                force: false,
+            })
+            .into_iter()
+            .collect();
+    }
+
+    match (read_only, forced) {
+        (false, false) => vec![
+            MountRetry {
+                label: "read-only",
+                options: read_only_mount_options(failed_options),
+                force: false,
+            },
+            MountRetry {
+                label: "read-write with force (DANGER)",
+                options: force_mount_options(failed_options),
+                force: true,
+            },
+        ],
+        (false, true) => vec![MountRetry {
+            label: "read-only",
+            options: read_only_mount_options(&without_force_mount_options(failed_options)),
+            force: false,
+        }],
+        (true, false) => vec![MountRetry {
+            label: "read-only with force (DANGER)",
+            options: force_mount_options(failed_options),
+            force: true,
+        }],
+        (true, true) => Vec::new(),
+    }
+}
+
+fn retry_prompt(retries: &[MountRetry]) -> String {
+    let safe = retries.iter().find(|retry| !retry.force);
+    let forced = retries.iter().find(|retry| retry.force);
+    match (safe, forced) {
+        (Some(safe), Some(forced)) => {
+            format!("Enter={}   F={}   Esc=cancel", safe.label, forced.label)
+        }
+        (Some(safe), None) => format!("Enter={}   Esc=cancel", safe.label),
+        (None, Some(forced)) => format!("F={}   Esc=cancel", forced.label),
+        (None, None) => "Esc=cancel".to_string(),
+    }
 }
 
 fn default_smb_fields() -> (String, String, String, String) {
@@ -2515,6 +2640,34 @@ mod tests {
         assert_eq!(read_only_mount_options("defaults"), "ro,defaults");
         assert!(mount_options_are_read_only("nodev,ro,errors=remount-ro"));
         assert!(!mount_options_are_read_only("rw,errors=remount-ro"));
+    }
+
+    #[test]
+    fn ntfs3_retry_flow_offers_the_requested_safe_and_dangerous_fallbacks() {
+        let retries = mount_retry_options("ntfs3", "rw,uid=1000");
+        assert_eq!(retries.len(), 2);
+        assert_eq!(retries[0].options, "ro,uid=1000");
+        assert!(!retries[0].force);
+        assert_eq!(retries[1].options, "force,rw,uid=1000");
+        assert!(retries[1].force);
+
+        let after_rw_force = mount_retry_options("ntfs3", "force,rw,uid=1000");
+        assert_eq!(after_rw_force[0].options, "ro,uid=1000");
+        assert!(!after_rw_force[0].force);
+
+        let after_ro = mount_retry_options("ntfs3", "ro,uid=1000");
+        assert_eq!(after_ro[0].options, "force,ro,uid=1000");
+        assert!(after_ro[0].force);
+        assert!(mount_retry_options("ntfs3", "force,ro,uid=1000").is_empty());
+    }
+
+    #[test]
+    fn non_ntfs3_retry_flow_remains_rw_to_ro_only() {
+        assert_eq!(
+            mount_retry_options("ext4", "rw,nodev")[0].options,
+            "ro,nodev"
+        );
+        assert!(mount_retry_options("ext4", "ro,nodev").is_empty());
     }
 
     #[test]
