@@ -110,6 +110,14 @@ enum Modal {
         fstype: String,
         opts: String,
         field: usize,
+        cursor: usize,
+    },
+    ConfirmReadOnlyMount {
+        source: String,
+        target: String,
+        fstype: String,
+        opts: String,
+        error: String,
     },
     SmbForm {
         source: String,
@@ -286,12 +294,14 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
                     state.modal = Modal::NeedRoot;
                 } else {
                     let (source, target, fstype, opts) = default_mount_fields(state);
+                    let cursor = source.chars().count();
                     state.modal = Modal::MountForm {
                         source,
                         target,
                         fstype,
                         opts,
                         field: 0,
+                        cursor,
                     };
                 }
             }
@@ -1140,26 +1150,55 @@ fn render_modal(f: &mut ratatui::Frame<'_>, state: &AppState, area: Rect) {
             fstype,
             opts,
             field,
+            cursor,
         } => {
             let fstype_line = if is_ntfs_driver(fstype) {
                 ntfs_driver_line(fstype, *field == 2)
             } else {
-                form_line("Fstype", fstype, *field == 2)
+                editable_form_line("Fstype", fstype, *field == 2, *cursor)
             };
             let lines = vec![
-                form_line("Source", source, *field == 0),
-                form_line("Target", target, *field == 1),
+                editable_form_line("Source", source, *field == 0, *cursor),
+                editable_form_line("Target", target, *field == 1, *cursor),
                 fstype_line,
-                form_line("Options", opts, *field == 3),
+                editable_form_line("Options", opts, *field == 3, *cursor),
                 Line::from(if is_ntfs_driver(fstype) {
                     "↑/↓/Tab: field  Space or ←/→: driver  Enter: next/mount  Esc: cancel"
                 } else {
-                    "↑/↓/Tab/Shift+Tab: field  Enter: next/mount  Esc: cancel"
+                    "↑/↓: field  ←/→/Home/End: cursor  Del/Backspace: edit  Enter: next/mount"
                 }),
             ];
             let widget = Paragraph::new(lines)
                 .alignment(Alignment::Left)
                 .block(Block::default().title("Mount").borders(Borders::ALL));
+            f.render_widget(Clear, rect);
+            f.render_widget(widget, rect);
+        }
+        Modal::ConfirmReadOnlyMount {
+            source,
+            target,
+            fstype,
+            opts,
+            error,
+        } => {
+            let body = vec![
+                Line::from(Span::styled(
+                    "Read-write mount failed",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(error.clone()),
+                Line::from(""),
+                Line::from(format!("Retry {source} on {target} as read-only?")),
+                Line::from(format!("Filesystem: {fstype}   Options: {opts}")),
+                Line::from("Enter=mount read-only  Esc=cancel"),
+            ];
+            let widget = Paragraph::new(body)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title("Read-only fallback")
+                        .borders(Borders::ALL),
+                );
             f.render_widget(Clear, rect);
             f.render_widget(widget, rect);
         }
@@ -1266,20 +1305,39 @@ fn ntfs_driver_line(driver: &str, active: bool) -> Line<'static> {
     ])
 }
 
-fn form_line(label: &str, value: &str, active: bool) -> Line<'static> {
-    let mut spans = Vec::new();
-    spans.push(Span::styled(
+fn editable_form_line(label: &str, value: &str, active: bool, cursor: usize) -> Line<'static> {
+    let mut spans = vec![Span::styled(
         format!("{label}: "),
         Style::default().fg(Color::DarkGray),
-    ));
-    let style = if active {
+    )];
+    if !active {
+        spans.push(Span::styled(
+            value.to_string(),
+            Style::default().fg(Color::White),
+        ));
+        return Line::from(spans);
+    }
+
+    let byte_cursor = char_to_byte_index(value, cursor);
+    let (before, after) = value.split_at(byte_cursor);
+    spans.push(Span::styled(
+        before.to_string(),
         Style::default()
             .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::White)
-    };
-    spans.push(Span::styled(value.to_string(), style));
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        "│",
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        after.to_string(),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ));
     Line::from(spans)
 }
 
@@ -1438,27 +1496,53 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
             fstype,
             opts,
             field,
+            cursor,
         } => match key.code {
             KeyCode::Esc => state.modal = Modal::None,
             KeyCode::Tab => {
                 *field = (*field + 1) % 4;
+                *cursor = mount_form_value(source, target, fstype, opts, *field)
+                    .chars()
+                    .count();
             }
             KeyCode::BackTab | KeyCode::Up => {
                 *field = field.saturating_sub(1);
+                *cursor = mount_form_value(source, target, fstype, opts, *field)
+                    .chars()
+                    .count();
             }
             KeyCode::Down => {
                 *field = (*field + 1).min(3);
+                *cursor = mount_form_value(source, target, fstype, opts, *field)
+                    .chars()
+                    .count();
             }
-            KeyCode::Home => *field = 0,
-            KeyCode::End => *field = 3,
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if *field == 2 && is_ntfs_driver(fstype) =>
             {
                 *fstype = toggled_ntfs_driver(fstype).to_string();
+                *cursor = fstype.chars().count();
+            }
+            KeyCode::Left => *cursor = cursor.saturating_sub(1),
+            KeyCode::Right => {
+                *cursor = (*cursor + 1).min(
+                    mount_form_value(source, target, fstype, opts, *field)
+                        .chars()
+                        .count(),
+                );
+            }
+            KeyCode::Home => *cursor = 0,
+            KeyCode::End => {
+                *cursor = mount_form_value(source, target, fstype, opts, *field)
+                    .chars()
+                    .count();
             }
             KeyCode::Enter => {
                 if *field < 3 {
                     *field += 1;
+                    *cursor = mount_form_value(source, target, fstype, opts, *field)
+                        .chars()
+                        .count();
                 } else {
                     if !Path::new(target.as_str()).exists()
                         && let Err(e) = fs::create_dir_all(target.as_str())
@@ -1490,33 +1574,79 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
                         }
                         Err(e) => {
                             state.status = format!("mount failed: {e}");
+                            if !mount_options_are_read_only(opts) {
+                                state.modal = Modal::ConfirmReadOnlyMount {
+                                    source: source.clone(),
+                                    target: target.clone(),
+                                    fstype: fstype.clone(),
+                                    opts: read_only_mount_options(opts),
+                                    error: e.to_string(),
+                                };
+                                return Ok(false);
+                            }
                         }
                     }
                     state.modal = Modal::None;
                 }
             }
-            KeyCode::Backspace => match *field {
-                0 => {
-                    source.pop();
+            KeyCode::Backspace => {
+                remove_char_before(
+                    mount_form_value_mut(source, target, fstype, opts, *field),
+                    cursor,
+                );
+            }
+            KeyCode::Delete => {
+                remove_char_at(
+                    mount_form_value_mut(source, target, fstype, opts, *field),
+                    *cursor,
+                );
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                mount_form_value_mut(source, target, fstype, opts, *field).clear();
+                *cursor = 0;
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_char_at(
+                    mount_form_value_mut(source, target, fstype, opts, *field),
+                    cursor,
+                    c,
+                );
+            }
+            _ => {}
+        },
+        Modal::ConfirmReadOnlyMount {
+            source,
+            target,
+            fstype,
+            opts,
+            error: _,
+        } => match key.code {
+            KeyCode::Esc => state.modal = Modal::None,
+            KeyCode::Enter => {
+                let mounted_target = target.clone();
+                match MountManager::mount(
+                    source,
+                    target,
+                    if fstype.is_empty() {
+                        None
+                    } else {
+                        Some(fstype.as_str())
+                    },
+                    Some(opts.as_str()),
+                    rustix::mount::MountFlags::empty(),
+                ) {
+                    Ok(()) => {
+                        state.mounts = MountManager::list_mounts().unwrap_or_default();
+                        state.devices = MountManager::list_block_devices().unwrap_or_default();
+                        rebuild_entries(state);
+                        state.status = format!("Mounted {mounted_target} read-only");
+                    }
+                    Err(error) => {
+                        state.status = format!("read-only mount failed: {error}");
+                    }
                 }
-                1 => {
-                    target.pop();
-                }
-                2 => {
-                    fstype.pop();
-                }
-                3 => {
-                    opts.pop();
-                }
-                _ => {}
-            },
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => match *field {
-                0 => source.push(c),
-                1 => target.push(c),
-                2 => fstype.push(c),
-                3 => opts.push(c),
-                _ => {}
-            },
+                state.modal = Modal::None;
+            }
             _ => {}
         },
         Modal::SmbForm {
@@ -1692,6 +1822,85 @@ fn default_mount_fields(state: &AppState) -> (String, String, String, String) {
     } else {
         (String::new(), String::new(), String::new(), String::new())
     }
+}
+
+fn mount_form_value<'a>(
+    source: &'a str,
+    target: &'a str,
+    fstype: &'a str,
+    opts: &'a str,
+    field: usize,
+) -> &'a str {
+    match field {
+        0 => source,
+        1 => target,
+        2 => fstype,
+        3 => opts,
+        _ => "",
+    }
+}
+
+fn mount_form_value_mut<'a>(
+    source: &'a mut String,
+    target: &'a mut String,
+    fstype: &'a mut String,
+    opts: &'a mut String,
+    field: usize,
+) -> &'a mut String {
+    match field {
+        0 => source,
+        1 => target,
+        2 => fstype,
+        3 => opts,
+        _ => opts,
+    }
+}
+
+fn char_to_byte_index(value: &str, cursor: usize) -> usize {
+    value
+        .char_indices()
+        .nth(cursor)
+        .map_or(value.len(), |(index, _)| index)
+}
+
+fn insert_char_at(value: &mut String, cursor: &mut usize, ch: char) {
+    let byte_index = char_to_byte_index(value, *cursor);
+    value.insert(byte_index, ch);
+    *cursor += 1;
+}
+
+fn remove_char_before(value: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    *cursor -= 1;
+    let start = char_to_byte_index(value, *cursor);
+    let end = char_to_byte_index(value, *cursor + 1);
+    value.replace_range(start..end, "");
+}
+
+fn remove_char_at(value: &mut String, cursor: usize) {
+    let start = char_to_byte_index(value, cursor);
+    let end = char_to_byte_index(value, cursor + 1);
+    if start < end {
+        value.replace_range(start..end, "");
+    }
+}
+
+fn mount_options_are_read_only(options: &str) -> bool {
+    options.split(',').any(|option| option.trim() == "ro")
+}
+
+fn read_only_mount_options(options: &str) -> String {
+    std::iter::once("ro")
+        .chain(
+            options
+                .split(',')
+                .map(str::trim)
+                .filter(|option| !option.is_empty() && !matches!(*option, "rw" | "ro")),
+        )
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn default_smb_fields() -> (String, String, String, String) {
@@ -2295,5 +2504,36 @@ mod tests {
             media_mount_target("Alice Smith", "Work files"),
             "/media/Alice_Smith/Work_files"
         );
+    }
+
+    #[test]
+    fn read_only_retry_replaces_rw_and_preserves_other_options() {
+        assert_eq!(
+            read_only_mount_options("rw,uid=1000,gid=1000,umask=022"),
+            "ro,uid=1000,gid=1000,umask=022"
+        );
+        assert_eq!(read_only_mount_options("defaults"), "ro,defaults");
+        assert!(mount_options_are_read_only("nodev,ro,errors=remount-ro"));
+        assert!(!mount_options_are_read_only("rw,errors=remount-ro"));
+    }
+
+    #[test]
+    fn mount_form_editor_changes_text_at_the_cursor() {
+        let mut value = "rw,uid=1000".to_string();
+        let mut cursor = 2;
+
+        insert_char_at(&mut value, &mut cursor, ',');
+        assert_eq!(value, "rw,,uid=1000");
+        remove_char_before(&mut value, &mut cursor);
+        assert_eq!(value, "rw,uid=1000");
+        remove_char_at(&mut value, cursor);
+        assert_eq!(value, "rwuid=1000");
+
+        let mut unicode = "том".to_string();
+        let mut unicode_cursor = 1;
+        insert_char_at(&mut unicode, &mut unicode_cursor, '-');
+        assert_eq!(unicode, "т-ом");
+        remove_char_before(&mut unicode, &mut unicode_cursor);
+        assert_eq!(unicode, "том");
     }
 }

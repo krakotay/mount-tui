@@ -97,6 +97,10 @@ Starting it from a regular user's `sudo` session preserves `SUDO_UID` and
 Forms support `↑` / `↓`, `Tab` / `Shift+Tab`, `Home` / `End`, and `Ctrl+U` to
 clear the active field. In the local mount form, NTFS drivers are displayed as
 an explicit `[x]` / `[ ]` selector and can be changed with `Space`, `←`, or `→`.
+Text fields have a visible cursor and support in-place editing with `←` / `→`,
+`Home` / `End`, `Backspace`, and `Delete`. If a read-write local mount fails,
+the application offers an interactive retry with the same options in read-only
+mode.
 
 ## SMB/CIFS
 

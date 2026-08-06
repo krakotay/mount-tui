@@ -10,7 +10,7 @@ default:
 
 # Build an optimized binary.
 build:
-    cargo build --release --locked
+    cargo build --release
 
 # Build and install the binary into PREFIX/bin (default: /usr/local/bin).
 install: build
@@ -20,7 +20,7 @@ install: build
 build-deb: build
     command -v cargo-deb >/dev/null || cargo install cargo-deb --version 3.7.0 --locked
     mkdir -p "{{ dist }}"
-    cargo deb --no-build --locked --output "{{ dist }}/{{ binary }}.deb"
+    cargo deb --no-build --output "{{ dist }}/{{ binary }}.deb"
 
 # Build and install the Debian package, including dependencies when apt is available.
 install-deb: build-deb
@@ -39,5 +39,5 @@ install-rpm: build-rpm
 # Run formatting, tests, and lints.
 check:
     cargo fmt --check
-    cargo test --locked
-    cargo clippy --locked --all-targets --all-features -- -D warnings
+    cargo test
+    cargo clippy --all-targets --all-features -- -D warnings
