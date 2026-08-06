@@ -1,67 +1,107 @@
 # mount-tui
 
-Небольшой Linux TUI для просмотра, монтирования и размонтирования локальных
-дисков и SMB/CIFS-ресурсов.
+[Русская версия](README.ru.md)
 
-## Сборка и запуск
+`mount-tui` is an interactive Linux terminal interface for inspecting, mounting,
+and unmounting local block devices and SMB/CIFS shares.
+
+## Features
+
+- Lists disks, partitions, mount points, filesystem types, sizes, and device metadata.
+- Shows whether every mounted directory belongs to the invoking desktop user.
+- Detects filesystems on unmounted devices from udev metadata without probing or
+  blocking on the device itself.
+- Mounts local filesystems with editable targets and options.
+- Offers an explicit NTFS driver selector: compatible `ntfs-3g` (default) or
+  the in-kernel `ntfs3` driver.
+- Connects and reconnects SMB/CIFS shares using an embedded credential form.
+- Passes SMB passwords through a temporary mode `0600` credentials file rather
+  than exposing them in process arguments.
+- Grants the desktop user access through suitable UID/GID mount options or by
+  changing only the mount root owner on Unix-native filesystems. The action is
+  disabled when ownership is already correct.
+- Supports filtering, mouse scrolling, optional pseudo-filesystems, and detailed
+  device information.
+
+## Requirements
+
+- Linux
+- A terminal with UTF-8 and color support
+- Root privileges for mount, unmount, and ownership operations
+- Rust 1.85 or newer to build from source (edition 2024)
+
+Optional runtime helpers:
+
+- `ntfs-3g` for the default, most compatible NTFS mode
+- `cifs-utils` (`mount.cifs`) for SMB/CIFS shares
+
+Examples for Debian/Ubuntu:
+
+```bash
+sudo apt install ntfs-3g cifs-utils
+```
+
+Fedora:
+
+```bash
+sudo dnf install ntfs-3g cifs-utils
+```
+
+Arch Linux:
+
+```bash
+sudo pacman -S ntfs-3g cifs-utils
+```
+
+## Build and run
 
 ```bash
 cargo build --release
 sudo ./target/release/mount-tui
 ```
 
-Для SMB нужен CIFS-helper из пакета `cifs-utils` (`mount.cifs`). Например:
+The application may be started without root. When a privileged operation is
+requested, press `R` in the privilege dialog to restart it through `sudo`.
+Starting it from a regular user's `sudo` session preserves `SUDO_UID` and
+`SUDO_GID`, allowing access to be granted to that user instead of root.
 
-```bash
-# Debian/Ubuntu
-sudo apt install cifs-utils
+## Controls
 
-# Fedora
-sudo dnf install cifs-utils
+| Key | Action |
+| --- | --- |
+| `↑` / `↓`, `PageUp` / `PageDown`, `Home` / `End` | Navigate devices |
+| `f` | Filter the device list |
+| `r` | Refresh mounts and devices |
+| `m` | Mount the selected local device |
+| `n` | Connect a new SMB/CIFS share |
+| `u` | Unmount the selected target |
+| `a` | Grant the invoking desktop user access |
+| `i` | Show or hide extended device information |
+| `d`, `t`, `s`, `p` | Toggle disks, partitions, SMB, or pseudo-filesystems |
+| `q` | Quit |
 
-# Arch Linux
-sudo pacman -S cifs-utils
-```
+Forms support `↑` / `↓`, `Tab` / `Shift+Tab`, `Home` / `End`, and `Ctrl+U` to
+clear the active field. In the local mount form, NTFS drivers are displayed as
+an explicit `[x]` / `[ ]` selector and can be changed with `Space`, `←`, or `→`.
 
-Для наиболее совместимого монтирования NTFS установите `ntfs-3g`. В форме
-монтирования он выбран по умолчанию. Форма показывает оба драйвера как явный
-переключатель (`[x] ntfs-3g` / `[ ] ntfs3`); клавишами `Space`, `←` или `→`
-можно выбрать драйвер ядра `ntfs3`.
+## SMB/CIFS
 
-Программу можно запустить без root. При первой операции монтирования нажмите
-`R` в диалоге повышения прав; после перезапуска через `sudo` повторите действие.
-Так `mount-tui` получает `SUDO_UID`/`SUDO_GID` и может назначить доступ именно
-вашему обычному пользователю.
+Enter a share as `//server/share`; `smb://server/share` is also accepted. An
+empty username selects guest access. Required and invalid values are highlighted
+before a mount command is started.
 
-## Управление
+By default, SMB mounts use the invoking user's UID/GID, `file_mode=0664`, and
+`dir_mode=0775`. The access action reconnects an existing SMB mount using the
+embedded credential form. Server-side ACLs still take precedence over client
+mount options.
 
-- `↑`/`↓`, `PageUp`/`PageDown`, `Home`/`End` — навигация;
-- `f` — фильтр, `r` — обновить список;
-- `m` — смонтировать выбранный локальный диск;
-- `s` — показать/скрыть уже подключённые SMB-ресурсы;
-- `n` — подключить новый SMB-ресурс;
-- `u` — размонтировать выбранную точку;
-- `a` — дать обычному пользователю доступ к выбранной точке;
-- `i` — дополнительные сведения;
-- `p`, `d`, `t` — показать/скрыть pseudo FS, диски и разделы;
-- `q` — выход.
+## NTFS drivers
 
-В SMB-форме (`n`) укажите ресурс в виде `//server/share` (также принимается
-`smb://server/share`). Пустое имя пользователя включает guest-доступ. Пароль
-на экране маскируется и передаётся `mount.cifs` через временный файл с правами
-`0600`; он удаляется сразу после завершения команды.
+For an NTFS volume, `ntfs-3g` is selected by default for compatibility. Select
+`ntfs3` in the mount form to use the newer in-kernel driver. `ntfs-3g` is a
+userspace FUSE driver and must be installed separately; the program invokes its
+system mount helper when selected.
 
-Пустые поля содержат inline-подсказки. Обязательные или некорректные значения
-сразу подсвечиваются красным. Между полями можно перемещаться клавишами `↑`/`↓`,
-`Tab`/`Shift+Tab`, а `Ctrl+U` очищает активное поле. При подтверждении форма
-возвращает курсор к первому полю с ошибкой, не запуская команду монтирования.
+## License
 
-По умолчанию SMB монтируется с `uid`/`gid` пользователя, запустившего `sudo`,
-а также с `file_mode=0664` и `dir_mode=0775`. Для существующего SMB-монта
-действие `a` открывает ту же встроенную форму на поле пароля, а затем
-переподключает ресурс с пользовательскими правами. Внешний парольный prompt
-`mount.cifs` при этом не используется. Для VFAT, exFAT и NTFS действие `a`
-также выполняет контролируемое переподключение. Для ext4, XFS, Btrfs и других
-Unix-файловых систем меняется владелец только корня выбранной точки; владельцы
-существующих вложенных файлов не затрагиваются. Серверные SMB ACL по-прежнему
-имеют приоритет и не могут быть обойдены клиентскими параметрами.
+Licensed under the [Apache License 2.0](LICENSE).

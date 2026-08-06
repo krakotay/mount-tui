@@ -1,8 +1,9 @@
 [package]
 name = "mount-tui"
-description = "Just a small TUI tool to mount"
-version = "0.3.0"
+description = "Interactive Linux TUI for mounting local filesystems and SMB shares"
+version = "0.4.0"
 edition = "2024"
+rust-version = "1.85"
 license = "Apache-2.0"
 authors = ["krakotay"]
 repository = "https://github.com/krakotay/mount-tui"
@@ -15,12 +16,16 @@ depends = "$auto, cifs-utils"
 assets = [
     ["target/release/mount-tui", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/mount-tui/README.md", "644"],
+    ["README.ru.md", "usr/share/doc/mount-tui/README.ru.md", "644"],
+    ["LICENSE", "usr/share/doc/mount-tui/LICENSE", "644"],
 ]
 
 [package.metadata.generate-rpm]
 assets = [
     { source = "target/release/mount-tui", dest = "/usr/bin/mount-tui", mode = "755" },
     { source = "README.md", dest = "/usr/share/doc/mount-tui/README.md", mode = "644", doc = true },
+    { source = "README.ru.md", dest = "/usr/share/doc/mount-tui/README.ru.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/doc/mount-tui/LICENSE", mode = "644", doc = true },
 ]
 
 [package.metadata.generate-rpm.requires]
