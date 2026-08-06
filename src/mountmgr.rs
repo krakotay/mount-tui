@@ -29,6 +29,9 @@ pub struct BlockDevice {
     pub mapper_name: Option<String>,
     pub model: Option<String>,
     pub vendor: Option<String>,
+    /// Filesystem signature reported by udev, if available. Detection is
+    /// best-effort: missing or malformed udev data never hides the device.
+    pub fstype: Option<String>,
 }
 
 /// Ошибки библиотеки
@@ -107,6 +110,18 @@ impl MountManager {
                 "target path does not exist: {}",
                 target
             )));
+        }
+
+        // ntfs-3g is a FUSE userspace driver, not a filesystem accepted by
+        // mount(2). It must be started through the mount helper.
+        if fstype == Some("ntfs-3g") {
+            let options = opts
+                .unwrap_or_default()
+                .split(',')
+                .filter(|option| !option.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            return mount_with_helper(source, target, "ntfs-3g", &options);
         }
 
         // nix::mount::mount accepts Option<&Path> or Option<&str> that implement NixPath.
@@ -253,6 +268,7 @@ impl MountManager {
 
             let model = read_trimmed(&format!("{}/device/model", sys_path));
             let vendor = read_trimmed(&format!("{}/device/vendor", sys_path));
+            let fstype = read_udev_property(&sys_path, "ID_FS_TYPE");
 
             out.push(BlockDevice {
                 name,
@@ -263,10 +279,25 @@ impl MountManager {
                 mapper_name,
                 model,
                 vendor,
+                fstype,
             });
         }
         Ok(out)
     }
+}
+
+fn read_udev_property(sys_path: &str, property: &str) -> Option<String> {
+    // /sys and /run/udev are local virtual/regular files. Unlike invoking
+    // blkid, reading them does not probe the block device and cannot hold up
+    // the UI on a damaged or sleeping drive.
+    let dev_id = fs::read_to_string(format!("{sys_path}/dev")).ok()?;
+    let data = fs::read_to_string(format!("/run/udev/data/b{}", dev_id.trim())).ok()?;
+    let prefix = format!("E:{property}=");
+    data.lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -562,11 +562,13 @@ fn draw_footer(f: &mut ratatui::Frame<'_>, state: &AppState, area: Rect) {
         .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(rows[1]);
 
+    let status_style = if status_is_error(&status) {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green)
+    };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            status,
-            Style::default().fg(Color::Green),
-        ))),
+        Paragraph::new(Line::from(Span::styled(status, status_style))),
         status_row[0],
     );
 
@@ -574,6 +576,13 @@ fn draw_footer(f: &mut ratatui::Frame<'_>, state: &AppState, area: Rect) {
         Paragraph::new(Line::from(Span::styled(root_text, root_style))).alignment(Alignment::Right),
         status_row[1],
     );
+}
+
+fn status_is_error(status: &str) -> bool {
+    let status = status.to_ascii_lowercase();
+    ["failed", "failure", "error", "einval"]
+        .iter()
+        .any(|marker| status.contains(marker))
 }
 
 fn render_table(state: &AppState, _area: Rect) -> Table<'static> {
@@ -736,7 +745,9 @@ fn build_entries(
 
         let mut mount_points = Vec::new();
         let mut mount_set = std::collections::HashSet::new();
-        let mut fstype = None;
+        // Keep udev's best-effort filesystem signature visible even when the
+        // device is not mounted. A mounted filesystem remains authoritative.
+        let mut fstype = dev.fstype.clone();
         let mut source = dev.path.clone();
         let mut options = Vec::new();
 
@@ -1065,12 +1076,21 @@ fn render_modal(f: &mut ratatui::Frame<'_>, state: &AppState, area: Rect) {
             opts,
             field,
         } => {
+            let fstype_line = if is_ntfs_driver(fstype) {
+                ntfs_driver_line(fstype, *field == 2)
+            } else {
+                form_line("Fstype", fstype, *field == 2)
+            };
             let lines = vec![
                 form_line("Source", source, *field == 0),
                 form_line("Target", target, *field == 1),
-                form_line("Fstype", fstype, *field == 2),
+                fstype_line,
                 form_line("Options", opts, *field == 3),
-                Line::from("Enter=next/confirm  Tab=next  Esc=cancel"),
+                Line::from(if is_ntfs_driver(fstype) {
+                    "Select driver with Space or ←/→  Enter=next/confirm  Esc=cancel"
+                } else {
+                    "Enter=next/confirm  Tab=next  Esc=cancel"
+                }),
             ];
             let widget = Paragraph::new(lines)
                 .alignment(Alignment::Left)
@@ -1150,6 +1170,35 @@ fn render_modal(f: &mut ratatui::Frame<'_>, state: &AppState, area: Rect) {
         }
         Modal::None => {}
     }
+}
+
+fn ntfs_driver_line(driver: &str, active: bool) -> Line<'static> {
+    let marker = if active { "> " } else { "  " };
+    let selected = Style::default()
+        .fg(Color::LightGreen)
+        .add_modifier(Modifier::BOLD);
+    let available = if active {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let ntfs_3g = if driver == "ntfs-3g" {
+        Span::styled("[x] ntfs-3g (compatible)", selected)
+    } else {
+        Span::styled("[ ] ntfs-3g (compatible)", available)
+    };
+    let ntfs3 = if driver == "ntfs3" {
+        Span::styled("[x] ntfs3 (kernel)", selected)
+    } else {
+        Span::styled("[ ] ntfs3 (kernel)", available)
+    };
+    Line::from(vec![
+        Span::styled(marker, Style::default().fg(Color::Yellow)),
+        Span::styled("NTFS driver: ", Style::default().fg(Color::DarkGray)),
+        ntfs_3g,
+        Span::raw("   "),
+        ntfs3,
+    ])
 }
 
 fn form_line(label: &str, value: &str, active: bool) -> Line<'static> {
@@ -1331,6 +1380,11 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
             }
             KeyCode::BackTab => {
                 *field = field.saturating_sub(1);
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                if *field == 2 && is_ntfs_driver(fstype) =>
+            {
+                *fstype = toggled_ntfs_driver(fstype).to_string();
             }
             KeyCode::Enter => {
                 if *field < 3 {
@@ -1758,7 +1812,7 @@ fn device_info_lines(entry: &UiEntry) -> Vec<String> {
     if let Some(label) = find_label_for_device(&dev_path) {
         out.push(format!("Label: {}", label));
     }
-    if let Some(fstype) = default_fstype(&dev_path) {
+    if let Some(fstype) = detected_fstype(&dev_path) {
         out.push(format!("FS Type: {}", fstype));
         let encrypted = fstype == "crypto_LUKS";
         if encrypted {
@@ -1844,6 +1898,10 @@ fn udev_data_for_device(dev_path: &str) -> Option<HashMap<String, String>> {
 }
 
 fn default_fstype(dev_path: &str) -> Option<String> {
+    detected_fstype(dev_path).map(|fstype| preferred_mount_fstype(&fstype).to_string())
+}
+
+fn detected_fstype(dev_path: &str) -> Option<String> {
     let dev_name = canonical_device_name(dev_path)?;
     let dev_file = format!("/sys/class/block/{}/dev", dev_name);
     let dev_id = fs::read_to_string(dev_file).ok()?;
@@ -1858,6 +1916,25 @@ fn default_fstype(dev_path: &str) -> Option<String> {
     None
 }
 
+fn preferred_mount_fstype(detected: &str) -> &str {
+    match detected {
+        "ntfs" | "ntfs3" | "ntfs-3g" => "ntfs-3g",
+        other => other,
+    }
+}
+
+fn is_ntfs_driver(fstype: &str) -> bool {
+    matches!(fstype, "ntfs" | "ntfs3" | "ntfs-3g")
+}
+
+fn toggled_ntfs_driver(fstype: &str) -> &'static str {
+    if fstype == "ntfs3" {
+        "ntfs-3g"
+    } else {
+        "ntfs3"
+    }
+}
+
 fn canonical_device_name(dev_path: &str) -> Option<String> {
     let canon = fs::canonicalize(dev_path).ok()?;
     canon.file_name().map(|s| s.to_string_lossy().to_string())
@@ -1868,7 +1945,7 @@ fn default_mount_opts(fstype: &str) -> String {
         return String::new();
     }
     match fstype {
-        "vfat" | "exfat" | "ntfs" | "ntfs3" => {
+        "vfat" | "exfat" | "ntfs" | "ntfs3" | "ntfs-3g" => {
             let (uid, gid) = effective_user_ids();
             format!("rw,{}", ownership_options(fstype, uid, gid))
         }
@@ -1966,6 +2043,43 @@ fn reexec_with_sudo() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ntfs_defaults_to_ntfs_3g_and_can_switch_to_kernel_driver() {
+        assert_eq!(preferred_mount_fstype("ntfs"), "ntfs-3g");
+        assert_eq!(preferred_mount_fstype("ntfs3"), "ntfs-3g");
+        assert_eq!(toggled_ntfs_driver("ntfs-3g"), "ntfs3");
+        assert_eq!(toggled_ntfs_driver("ntfs3"), "ntfs-3g");
+    }
+
+    #[test]
+    fn failed_statuses_are_rendered_as_errors() {
+        assert!(status_is_error("mount failed: Nix(EINVAL)"));
+        assert!(status_is_error("IO error: permission denied"));
+        assert!(!status_is_error("Mounted"));
+        assert!(!status_is_error("Refreshed"));
+    }
+
+    #[test]
+    fn unmounted_device_keeps_safely_detected_filesystem_in_main_list() {
+        let device = BlockDevice {
+            name: "sdb1".to_string(),
+            path: "/dev/sdb1".to_string(),
+            size_bytes: Some(1024),
+            removable: true,
+            is_partition: true,
+            mapper_name: None,
+            model: None,
+            vendor: None,
+            fstype: Some("ntfs".to_string()),
+        };
+
+        let entries = build_entries(&[], &[device], false, true, true, true, "");
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].mount_points.is_empty());
+        assert_eq!(entries[0].fstype.as_deref(), Some("ntfs"));
+    }
 
     #[test]
     fn smb_mounts_are_visible_without_pseudo_filesystems() {
