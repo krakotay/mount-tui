@@ -1,8 +1,5 @@
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseEventKind,
-    },
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -87,7 +84,6 @@ struct AppState {
     show_smb: bool,
     show_partitions: bool,
     show_disks: bool,
-    last_table_area: Rect,
     status: String,
     last_refresh: SystemTime,
     modal: Modal,
@@ -130,7 +126,7 @@ enum Modal {
 fn main() -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -147,9 +143,7 @@ fn main() -> anyhow::Result<()> {
                         break;
                     }
                 }
-                Event::Mouse(mouse) => {
-                    handle_mouse(&mut state, mouse);
-                }
+                Event::Mouse(_) => {}
                 Event::Resize(_, _) => {}
                 Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
             }
@@ -157,11 +151,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -181,7 +171,6 @@ fn init_state() -> anyhow::Result<AppState> {
         show_smb: true,
         show_partitions: true,
         show_disks: true,
-        last_table_area: Rect::new(0, 0, 0, 0),
         status: String::new(),
         last_refresh: SystemTime::now(),
         modal: Modal::None,
@@ -392,36 +381,6 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
     Ok(false)
 }
 
-fn handle_mouse(state: &mut AppState, mouse: crossterm::event::MouseEvent) {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => select_prev(state, 3),
-        MouseEventKind::ScrollDown => select_next(state, 3),
-        MouseEventKind::Down(_) => {
-            if state.last_table_area.width == 0 || state.last_table_area.height == 0 {
-                return;
-            }
-            let inner = state.last_table_area.inner(ratatui::layout::Margin {
-                vertical: 1,
-                horizontal: 1,
-            });
-            let header_row = inner.y;
-            let body_start = header_row.saturating_add(1);
-            let body_end = body_start.saturating_add(state.entries.len() as u16);
-            if mouse.column >= inner.x
-                && mouse.column < inner.x + inner.width
-                && mouse.row >= body_start
-                && mouse.row < body_end
-            {
-                let row_index = (mouse.row - body_start) as usize;
-                state.selected = row_index;
-                state.table_state.select(Some(state.selected));
-                update_info_extra_on_selection(state);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn draw_ui<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     state: &mut AppState,
@@ -450,7 +409,6 @@ where
             .split(layout[1]);
 
         let table = render_table(state, body[0]);
-        state.last_table_area = body[0];
         f.render_stateful_widget(table, body[0], &mut state.table_state);
 
         let details = render_details(state);
@@ -1502,10 +1460,6 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
                 if *field < 3 {
                     *field += 1;
                 } else {
-                    let mut flags = rustix::mount::MountFlags::empty();
-                    if opts.split(',').any(|x| x == "ro") {
-                        flags |= rustix::mount::MountFlags::RDONLY;
-                    }
                     if !Path::new(target.as_str()).exists()
                         && let Err(e) = fs::create_dir_all(target.as_str())
                     {
@@ -1526,7 +1480,7 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
                         } else {
                             Some(opts.as_str())
                         },
-                        flags,
+                        rustix::mount::MountFlags::empty(),
                     ) {
                         Ok(()) => {
                             state.mounts = MountManager::list_mounts().unwrap_or_default();
@@ -1535,7 +1489,7 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
                             state.status = "Mounted".to_string();
                         }
                         Err(e) => {
-                            state.status = format!("mount failed: {e:?}");
+                            state.status = format!("mount failed: {e}");
                         }
                     }
                     state.modal = Modal::None;
@@ -1883,18 +1837,23 @@ fn default_smb_target(source: &str) -> String {
 }
 
 fn default_mount_target(source: &str) -> String {
-    if source.starts_with("/dev/") {
-        if let Some(label) = find_label_for_device(source) {
-            let user = effective_user_name();
-            let clean = sanitize_mount_name(&label);
-            return format!("/media/{}/{}", user, clean);
-        }
-        if let Some(name) = source.split('/').next_back() {
-            return format!("/mnt/{}", name);
-        }
-    }
-    let clean = sanitize_mount_name(source);
-    format!("/mnt/{}", clean)
+    let name = find_label_for_device(source).unwrap_or_else(|| {
+        source
+            .strip_prefix("/dev/")
+            .and_then(|path| path.rsplit('/').next())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(source)
+            .to_string()
+    });
+    media_mount_target(&effective_user_name(), &name)
+}
+
+fn media_mount_target(user: &str, name: &str) -> String {
+    format!(
+        "/media/{}/{}",
+        sanitize_mount_name(user),
+        sanitize_mount_name(name)
+    )
 }
 
 fn is_root() -> bool {
@@ -2162,7 +2121,7 @@ fn sanitize_mount_name(name: &str) -> String {
 
 fn reexec_with_sudo() -> anyhow::Result<()> {
     disable_raw_mode().ok();
-    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture).ok();
+    execute!(io::stdout(), LeaveAlternateScreen).ok();
     let exe = env::current_exe()?;
     let args: Vec<String> = env::args().skip(1).collect();
     let status = Command::new("sudo").arg(exe).args(args).status()?;
@@ -2327,5 +2286,14 @@ mod tests {
             Ownership::Mixed
         );
         assert_eq!(ownership_from_uids(&[None], 1000), Ownership::Unknown);
+    }
+
+    #[test]
+    fn local_mount_targets_use_the_desktop_media_directory() {
+        assert_eq!(media_mount_target("alice", "sda2"), "/media/alice/sda2");
+        assert_eq!(
+            media_mount_target("Alice Smith", "Work files"),
+            "/media/Alice_Smith/Work_files"
+        );
     }
 }

@@ -133,9 +133,9 @@ impl MountManager {
                 .collect::<Vec<_>>();
             return mount_with_helper(source, target, "auto", &options);
         };
-        let data = opts
-            .filter(|options| !options.is_empty())
-            .map(CString::new)
+        let (flags, data_options) = prepare_mount_options(opts, flags);
+        let data = (!data_options.is_empty())
+            .then(|| CString::new(data_options.join(",")))
             .transpose()
             .map_err(|_| MountError::Other("mount options contain a NUL byte".to_string()))?;
         rustix::mount::mount(source, target, fstype, flags, data.as_deref())?;
@@ -293,6 +293,44 @@ impl MountManager {
         }
         Ok(out)
     }
+}
+
+fn prepare_mount_options(opts: Option<&str>, mut flags: MountFlags) -> (MountFlags, Vec<&str>) {
+    let mut data = Vec::new();
+    for option in opts
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+    {
+        match option {
+            // mount(8)/fstab options must not be passed as filesystem data.
+            // In particular, ext4 rejects `defaults` with EINVAL.
+            "defaults" | "auto" | "noauto" | "user" | "nouser" | "users" | "nofail" | "owner"
+            | "group" | "_netdev" => {}
+            "ro" => flags.insert(MountFlags::RDONLY),
+            "rw" => flags.remove(MountFlags::RDONLY),
+            "nosuid" => flags.insert(MountFlags::NOSUID),
+            "suid" => flags.remove(MountFlags::NOSUID),
+            "nodev" => flags.insert(MountFlags::NODEV),
+            "dev" => flags.remove(MountFlags::NODEV),
+            "noexec" => flags.insert(MountFlags::NOEXEC),
+            "exec" => flags.remove(MountFlags::NOEXEC),
+            "sync" => flags.insert(MountFlags::SYNCHRONOUS),
+            "async" => flags.remove(MountFlags::SYNCHRONOUS),
+            "dirsync" => flags.insert(MountFlags::DIRSYNC),
+            "noatime" => flags.insert(MountFlags::NOATIME),
+            "atime" => flags.remove(MountFlags::NOATIME),
+            "nodiratime" => flags.insert(MountFlags::NODIRATIME),
+            "diratime" => flags.remove(MountFlags::NODIRATIME),
+            "relatime" => flags.insert(MountFlags::RELATIME),
+            "strictatime" => flags.insert(MountFlags::STRICTATIME),
+            "lazytime" => flags.insert(MountFlags::LAZYTIME),
+            "nolazytime" => flags.remove(MountFlags::LAZYTIME),
+            "nosymfollow" => flags.insert(MountFlags::NOSYMFOLLOW),
+            other => data.push(other),
+        }
+    }
+    (flags, data)
 }
 
 fn read_udev_property(sys_path: &str, property: &str) -> Option<String> {
@@ -646,6 +684,27 @@ mod tests {
     fn test_unescape() {
         assert_eq!(unescape_mount_field("foo\\040bar"), "foo bar");
         assert_eq!(unescape_mount_field("a\\040b\\011c"), "a b\tc");
+    }
+
+    #[test]
+    fn separates_mount_flags_from_filesystem_options() {
+        let (flags, data) = prepare_mount_options(
+            Some("defaults,ro,nodev,noexec,errors=remount-ro"),
+            MountFlags::empty(),
+        );
+
+        assert!(flags.contains(MountFlags::RDONLY));
+        assert!(flags.contains(MountFlags::NODEV));
+        assert!(flags.contains(MountFlags::NOEXEC));
+        assert_eq!(data, ["errors=remount-ro"]);
+    }
+
+    #[test]
+    fn defaults_are_not_sent_to_ext4_as_mount_data() {
+        let (flags, data) = prepare_mount_options(Some("defaults"), MountFlags::empty());
+
+        assert!(flags.is_empty());
+        assert!(data.is_empty());
     }
 
     #[test]

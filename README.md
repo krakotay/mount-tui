@@ -12,6 +12,7 @@ and unmounting local block devices and SMB/CIFS shares.
 - Detects filesystems on unmounted devices from udev metadata without probing or
   blocking on the device itself.
 - Mounts local filesystems with editable targets and options.
+- Uses desktop-friendly `/media/<user>/<label-or-device>` mount targets by default.
 - Offers an explicit NTFS driver selector: compatible `ntfs-3g` (default) or
   the in-kernel `ntfs3` driver.
 - Connects and reconnects SMB/CIFS shares using an embedded credential form.
@@ -20,8 +21,8 @@ and unmounting local block devices and SMB/CIFS shares.
 - Grants the desktop user access through suitable UID/GID mount options or by
   changing only the mount root owner on Unix-native filesystems. The action is
   disabled when ownership is already correct.
-- Supports filtering, mouse scrolling, optional pseudo-filesystems, and detailed
-  device information.
+- Supports filtering, terminal-native mouse text selection/copying, optional
+  pseudo-filesystems, and detailed device information.
 
 ## Requirements
 
@@ -59,6 +60,19 @@ sudo pacman -S ntfs-3g cifs-utils
 cargo build --release
 sudo ./target/release/mount-tui
 ```
+
+With [`just`](https://github.com/casey/just), build and install the preferred
+format in one command:
+
+```bash
+just install       # release binary in /usr/local/bin
+just install-deb   # build and install a DEB package
+just install-rpm   # build and install an RPM package
+```
+
+Set `PREFIX` to change the binary installation prefix, for example
+`PREFIX=/usr just install`. Packaging tools are installed through Cargo on
+first use if they are not already available.
 
 The application may be started without root. When a privileged operation is
 requested, press `R` in the privilege dialog to restart it through `sudo`.
