@@ -34,10 +34,10 @@ fuse-sshfs = "*"
 
 [dependencies]
 anyhow = "1.0.104"
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 crossterm = "0.29.0"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
-rustix = { version = "1.1.4", features = ["fs", "mount", "process"] }
+rustix = { version = "1.1.5", features = ["fs", "mount", "process"] }
 
 [profile.release]
 strip = true
