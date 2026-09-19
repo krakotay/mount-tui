@@ -1,5 +1,5 @@
 # mount-tui
-<img width="1920" height="976" alt="image" src="https://github.com/user-attachments/assets/b151178e-d8c4-4fae-b882-7a207cd56fd4" />
+<img width="1024" height="650" alt="Screenshot_2026-09-19_18-35-57" src="https://github.com/user-attachments/assets/9692f384-288f-4b19-b8c6-3390712ead45" />
 
 [Русская версия](README.ru.md)
 
