@@ -20,9 +20,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, SystemTime};
 use std::{env, process::Command};
 const VIRTUAL_PREFIXES: &[&str] = &["loop", "ram", "zram", "fd"];
+const SSH_KEY_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const PSEUDO_FSTYPES: &[&str] = &[
     "proc",
     "sysfs",
@@ -95,12 +98,27 @@ struct AppState {
     ssh_hosts: Vec<SshHost>,
     fstab_entries: Vec<FstabRecord>,
     show_fstab: bool,
+    ssh_key_verification: Option<SshKeyVerification>,
+}
+
+#[derive(Debug)]
+enum SshKeyVerification {
+    Running {
+        receiver: Receiver<Result<(), String>>,
+        frame: usize,
+        frames_shown: usize,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
 enum Modal {
     None,
-    NeedRoot,
+    NeedRoot {
+        action: &'static str,
+    },
     ConfirmUnmount {
         mount_points: Vec<String>,
         selected: usize,
@@ -197,6 +215,7 @@ pub fn run() -> anyhow::Result<()> {
 
     let tick_rate = Duration::from_millis(250);
     loop {
+        poll_ssh_key_verification(&mut state);
         draw_ui(&mut terminal, &mut state)?;
 
         if event::poll(tick_rate)? {
@@ -242,9 +261,64 @@ fn init_state() -> anyhow::Result<AppState> {
         ssh_hosts: read_ssh_config(&effective_user_home()).unwrap_or_default(),
         fstab_entries: read_fstab(Path::new("/etc/fstab")).unwrap_or_default(),
         show_fstab: false,
+        ssh_key_verification: None,
     };
     rebuild_entries(&mut state);
     Ok(state)
+}
+
+fn poll_ssh_key_verification(state: &mut AppState) {
+    enum Outcome {
+        Pending,
+        Verified,
+        Failed(String),
+    }
+
+    let outcome = match state.ssh_key_verification.as_mut() {
+        Some(SshKeyVerification::Running {
+            receiver,
+            frame,
+            frames_shown,
+        }) => {
+            *frame = (*frame + 1) % SSH_KEY_SPINNER.len();
+            if *frames_shown == 0 {
+                *frames_shown = 1;
+                Outcome::Pending
+            } else {
+                match receiver.try_recv() {
+                    Ok(Ok(())) => Outcome::Verified,
+                    Ok(Err(message)) => Outcome::Failed(message),
+                    Err(TryRecvError::Empty) => {
+                        *frames_shown += 1;
+                        Outcome::Pending
+                    }
+                    Err(TryRecvError::Disconnected) => Outcome::Failed(
+                        "the SSH verification worker stopped without returning a result"
+                            .to_string(),
+                    ),
+                }
+            }
+        }
+        Some(SshKeyVerification::Failed { .. }) | None => return,
+    };
+
+    match outcome {
+        Outcome::Pending => {}
+        Outcome::Verified => {
+            state.ssh_key_verification = None;
+            if let Modal::SshForm { permanent, .. } = &mut state.modal {
+                *permanent = true;
+            }
+            state.status = "SSH key verified; /etc/fstab is enabled".to_string();
+        }
+        Outcome::Failed(message) => {
+            if let Modal::SshForm { permanent, .. } = &mut state.modal {
+                *permanent = false;
+            }
+            state.status = format!("SSH key verification failed: {message}");
+            state.ssh_key_verification = Some(SshKeyVerification::Failed { message });
+        }
+    }
 }
 
 fn rebuild_entries(state: &mut AppState) {
@@ -278,6 +352,18 @@ fn rebuild_entries(state: &mut AppState) {
 }
 
 fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
+    if let Some(verification) = &state.ssh_key_verification {
+        match verification {
+            SshKeyVerification::Running { .. } => return Ok(false),
+            SshKeyVerification::Failed { .. } => {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                    state.ssh_key_verification = None;
+                }
+                return Ok(false);
+            }
+        }
+    }
+
     if !matches!(state.modal, Modal::None) {
         return handle_modal_key(state, key);
     }
@@ -355,7 +441,9 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
                         "This is an fstab configuration entry, not a live mount".to_string();
                 } else if !entry.mount_points.is_empty() {
                     if !is_root() {
-                        state.modal = Modal::NeedRoot;
+                        state.modal = Modal::NeedRoot {
+                            action: "Unmounting",
+                        };
                     } else {
                         state.modal = Modal::ConfirmUnmount {
                             mount_points: entry.mount_points.clone(),
@@ -376,7 +464,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
                 } else if !entry.mount_points.is_empty() {
                     state.status = "Already mounted (use unmount)".to_string();
                 } else if !is_root() {
-                    state.modal = Modal::NeedRoot;
+                    state.modal = Modal::NeedRoot { action: "Mounting" };
                 } else {
                     let (source, target, fstype, opts) = default_mount_fields(state);
                     let cursor = source.chars().count();
@@ -402,7 +490,9 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
         }
         KeyCode::Char('n') => {
             if !is_root() {
-                state.modal = Modal::NeedRoot;
+                state.modal = Modal::NeedRoot {
+                    action: "Mounting SMB",
+                };
             } else {
                 let (source, target, username, opts) = default_smb_fields();
                 state.modal = Modal::SmbForm {
@@ -420,7 +510,9 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
         }
         KeyCode::Char('h') => {
             if !is_root() {
-                state.modal = Modal::NeedRoot;
+                state.modal = Modal::NeedRoot {
+                    action: "Mounting SSH",
+                };
             } else {
                 state.modal = Modal::SshHosts { selected: 0 };
             }
@@ -460,13 +552,19 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
                     .iter()
                     .find(|record| record.line_index == line_index)
             {
-                let raw = record.entry.render();
-                state.modal = Modal::FstabEdit {
-                    cursor: raw.chars().count(),
-                    line_index,
-                    original: raw.clone(),
-                    raw,
-                };
+                if !is_root() {
+                    state.modal = Modal::NeedRoot {
+                        action: "Editing /etc/fstab",
+                    };
+                } else {
+                    let raw = record.entry.render();
+                    state.modal = Modal::FstabEdit {
+                        cursor: raw.chars().count(),
+                        line_index,
+                        original: raw.clone(),
+                        raw,
+                    };
+                }
             }
         }
         KeyCode::Delete => {
@@ -477,10 +575,16 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
                     .iter()
                     .find(|record| record.line_index == line_index)
             {
-                state.modal = Modal::ConfirmFstabRemove {
-                    line_index,
-                    raw: record.entry.render(),
-                };
+                if !is_root() {
+                    state.modal = Modal::NeedRoot {
+                        action: "Removing from /etc/fstab",
+                    };
+                } else {
+                    state.modal = Modal::ConfirmFstabRemove {
+                        line_index,
+                        raw: record.entry.render(),
+                    };
+                }
             }
         }
         KeyCode::Char('a') => {
@@ -500,7 +604,9 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
                         "No regular user detected; start mount-tui via sudo as that user"
                             .to_string();
                 } else if !is_root() {
-                    state.modal = Modal::NeedRoot;
+                    state.modal = Modal::NeedRoot {
+                        action: "Changing mount ownership",
+                    };
                 } else if entry.fstype.as_deref().is_some_and(is_smb_fstype) {
                     let (source, target, username, domain, opts) = smb_reconnect_fields(entry);
                     let previous_mount = state
@@ -547,7 +653,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
 
 fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
     match &mut state.modal {
-        Modal::NeedRoot => match key.code {
+        Modal::NeedRoot { .. } => match key.code {
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 reexec_with_sudo()?;
             }
@@ -1017,10 +1123,14 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
                             .to_string();
                 } else if let Err(error) = boot_ssh_identity(opts) {
                     *permanent = false;
-                    state.status = error;
+                    state.status = format!("SSH key verification failed: {error}");
+                    state.ssh_key_verification =
+                        Some(SshKeyVerification::Failed { message: error });
                 } else if let Err(error) = prepare_user_known_hosts() {
                     *permanent = false;
-                    state.status = format!("known_hosts setup failed: {error}");
+                    let message = format!("known_hosts setup failed: {error}");
+                    state.status = format!("SSH key verification failed: {message}");
+                    state.ssh_key_verification = Some(SshKeyVerification::Failed { message });
                 } else {
                     let options = opts
                         .split(',')
@@ -1030,23 +1140,25 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
                         .collect::<Vec<_>>();
                     let config = effective_user_home().join(".ssh/config");
                     let local_user = effective_user_name();
-                    match MountManager::check_ssh_key(
-                        host,
-                        &options,
-                        Some(&config),
-                        Some(&local_user),
-                    ) {
-                        Ok(()) => {
-                            *permanent = true;
-                            state.status = "SSH key verified; /etc/fstab is enabled".to_string();
-                        }
-                        Err(error) => {
-                            *permanent = false;
-                            state.status = format!(
-                                "SSH key verification failed; /etc/fstab stays disabled: {error}"
-                            );
-                        }
-                    }
+                    let host = host.clone();
+                    let (sender, receiver) = mpsc::channel();
+                    thread::spawn(move || {
+                        let result = MountManager::check_ssh_key(
+                            &host,
+                            &options,
+                            Some(&config),
+                            Some(&local_user),
+                        )
+                        .map_err(|error| error.to_string());
+                        let _ = sender.send(result);
+                    });
+                    *permanent = false;
+                    state.ssh_key_verification = Some(SshKeyVerification::Running {
+                        receiver,
+                        frame: 0,
+                        frames_shown: 0,
+                    });
+                    state.status = "Verifying SSH key with the server...".to_string();
                 }
             }
             KeyCode::Enter => {
@@ -1196,8 +1308,9 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
                                 "SSH /etc/fstab entries require verified key authentication; use the h SSH form"
                                     .to_string();
                         } else if !is_root() {
-                            state.status =
-                                "Adding to /etc/fstab requires root; restart with sudo".to_string();
+                            state.modal = Modal::NeedRoot {
+                                action: "Adding to /etc/fstab",
+                            };
                         } else {
                             if !Path::new(&entry.target).exists()
                                 && let Err(error) = fs::create_dir_all(&entry.target)
@@ -1232,8 +1345,9 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
             KeyCode::Esc => state.modal = Modal::None,
             KeyCode::Enter => {
                 if !is_root() {
-                    state.status =
-                        "Editing /etc/fstab requires root; restart with sudo".to_string();
+                    state.modal = Modal::NeedRoot {
+                        action: "Editing /etc/fstab",
+                    };
                     return Ok(false);
                 }
                 let current = read_fstab(Path::new("/etc/fstab")).and_then(|records| {
@@ -1276,8 +1390,9 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
             KeyCode::Esc => state.modal = Modal::None,
             KeyCode::Enter => {
                 if !is_root() {
-                    state.status =
-                        "Removing from /etc/fstab requires root; restart with sudo".to_string();
+                    state.modal = Modal::NeedRoot {
+                        action: "Removing from /etc/fstab",
+                    };
                     return Ok(false);
                 }
                 let unchanged = read_fstab(Path::new("/etc/fstab")).and_then(|records| {

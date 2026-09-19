@@ -1,9 +1,8 @@
 [package]
 name = "mount-tui"
 description = "Interactive Linux TUI for mounting local, SMB, and SSH filesystems"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
-rust-version = "1.85"
 license = "Apache-2.0"
 authors = ["krakotay"]
 repository = "https://github.com/krakotay/mount-tui"

@@ -149,6 +149,8 @@ so options such as `ProxyJump` continue to work. The permanent toggle is
 disabled for password authentication or when there is no usable private key.
 Enabling it validates that the private key needs no passphrase and that the
 server accepts that exact key; a missing or wrong key leaves the toggle off.
+This server check runs in the background with an animated progress dialog; a
+failure dialog shows the SSH error and keeps `/etc/fstab` disabled.
 Permanent entries include `_netdev` and `nofail`.
 They also add `allow_other` and `default_permissions` together with the original
 user's UID/GID, because boot-time fstab mounts are created by root.
@@ -172,7 +174,8 @@ view is hidden by default. Select an entry and press `e` to edit its complete
 raw line, or `Delete` to remove it after confirmation. Changes are validated,
 written atomically, and preserve comments and unrelated lines. Before the first
 edit or removal, mount-tui creates `/etc/fstab.mount-tui.bak` if it does not
-already exist.
+already exist. When running without root, edit and remove open the privilege
+dialog so mount-tui can be restarted through `sudo`.
 
 ## NTFS drivers
 

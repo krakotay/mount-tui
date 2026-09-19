@@ -44,6 +44,10 @@ where
         if !matches!(state.modal, Modal::None) {
             render_modal(f, state, size);
         }
+
+        if state.ssh_key_verification.is_some() {
+            render_ssh_key_verification(f, state, size);
+        }
     })?;
     Ok(())
 }
@@ -780,10 +784,10 @@ pub(super) fn render_modal(f: &mut ratatui::Frame<'_>, state: &AppState, area: R
     let rect = Rect::new(x, y, width, height);
 
     match &state.modal {
-        Modal::NeedRoot => {
+        Modal::NeedRoot { action } => {
             let body = vec![
-                Line::from("This action requires root privileges."),
-                Line::from("Press R to re-run with sudo, or Esc to cancel."),
+                Line::from(format!("{action} requires root privileges.")),
+                Line::from("Press R to restart mount-tui with sudo, or Esc to cancel."),
             ];
             let widget = Paragraph::new(body)
                 .alignment(Alignment::Left)
@@ -1227,6 +1231,55 @@ pub(super) fn render_modal(f: &mut ratatui::Frame<'_>, state: &AppState, area: R
         }
         Modal::None => {}
     }
+}
+
+fn render_ssh_key_verification(f: &mut ratatui::Frame<'_>, state: &AppState, area: Rect) {
+    let width = area.width.saturating_mul(2) / 3;
+    let (height, title, lines) = match state.ssh_key_verification.as_ref() {
+        Some(SshKeyVerification::Running { frame, .. }) => {
+            let spinner = SSH_KEY_SPINNER[*frame % SSH_KEY_SPINNER.len()];
+            (
+                7,
+                "Verifying SSH key",
+                vec![
+                    Line::from(Span::styled(
+                        format!("{spinner}  Key is verifying, please wait..."),
+                        Style::default()
+                            .fg(Color::LightCyan)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from("Checking the selected private key against the SSH server."),
+                    Line::from("The /etc/fstab option remains disabled until this succeeds."),
+                ],
+            )
+        }
+        Some(SshKeyVerification::Failed { message }) => (
+            10,
+            "SSH key verification failed",
+            vec![
+                Line::from(Span::styled(
+                    "The SSH key could not be verified.",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(message.clone()),
+                Line::from(""),
+                Line::from("The /etc/fstab option remains disabled."),
+                Line::from("Press Enter or Esc to return to the SSH form."),
+            ],
+        ),
+        None => return,
+    };
+    let height = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+    let widget = Paragraph::new(lines)
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .block(Block::default().title(title).borders(Borders::ALL));
+    f.render_widget(Clear, rect);
+    f.render_widget(widget, rect);
 }
 
 pub(super) fn ntfs_driver_line(driver: &str, active: bool) -> Line<'static> {
