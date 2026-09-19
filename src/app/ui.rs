@@ -15,7 +15,7 @@ where
             .constraints([
                 Constraint::Length(4),
                 Constraint::Min(5),
-                Constraint::Length(4),
+                Constraint::Length(5),
             ])
             .split(size);
 
@@ -93,6 +93,8 @@ pub(super) fn render_header(state: &AppState) -> Paragraph<'static> {
             count,
             Span::raw("   "),
             filter,
+            Span::raw("   | "),
+            toggle_span("[b] fstab", state.show_fstab),
         ]),
         Line::from(vec![
             toggle_span("[d] disks", state.show_disks),
@@ -114,6 +116,10 @@ pub(super) fn draw_footer(f: &mut ratatui::Frame<'_>, state: &AppState, area: Re
         state.status.clone()
     };
     let (can_mount, can_unmount, can_access) = selected_actions(state);
+    let is_fstab_entry = state
+        .entries
+        .get(state.selected)
+        .is_some_and(|entry| entry.fstab_line.is_some());
     let root = is_root();
     let root_text = if root { "root: yes" } else { "root: no" };
     let root_style = if root {
@@ -131,10 +137,14 @@ pub(super) fn draw_footer(f: &mut ratatui::Frame<'_>, state: &AppState, area: Re
     });
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
-    let hint = Line::from(vec![
+    let navigation_hint = Line::from(vec![
         Span::styled("↑↓", Style::default().fg(Color::DarkGray)),
         Span::raw(" move | "),
         Span::styled("f", Style::default().fg(Color::DarkGray)),
@@ -143,21 +153,37 @@ pub(super) fn draw_footer(f: &mut ratatui::Frame<'_>, state: &AppState, area: Re
         Span::raw(" refresh | "),
         footer_action_span("m", "mount", can_mount),
         Span::raw(" | "),
-        footer_action_span("n", "SMB", true),
-        Span::raw(" | "),
         footer_action_span("u", "umount", can_unmount),
         Span::raw(" | "),
         footer_action_span("a", "access", can_access),
         Span::raw(" | "),
+        Span::styled("i", Style::default().fg(Color::DarkGray)),
+        Span::raw(" info"),
+    ]);
+    let action_hint = Line::from(vec![
+        footer_action_span("n", "SMB", true),
+        Span::raw(" | "),
+        footer_action_span("h", "SSH", true),
+        Span::raw(" | "),
+        footer_action_span("x", "export", state.entries.get(state.selected).is_some()),
+        Span::raw(" | "),
+        Span::styled("b", Style::default().fg(Color::DarkGray)),
+        Span::raw(" fstab | "),
+        footer_action_span("e", "edit", is_fstab_entry),
+        Span::raw(" | "),
+        footer_action_span("Del", "remove", is_fstab_entry),
+        Span::raw(" | "),
         Span::styled("q", Style::default().fg(Color::DarkGray)),
+        Span::raw(" quit"),
     ]);
 
-    f.render_widget(Paragraph::new(hint), rows[0]);
+    f.render_widget(Paragraph::new(navigation_hint), rows[0]);
+    f.render_widget(Paragraph::new(action_hint), rows[1]);
 
     let status_row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-        .split(rows[1]);
+        .split(rows[2]);
 
     let status_style = if status_is_error(&status) {
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
@@ -403,6 +429,7 @@ pub(super) fn build_entries(
             vendor: dev.vendor.clone(),
             options,
             ownership: ownership_from_uids(&owner_uids, effective_user_ids().0),
+            fstab_line: None,
         });
     }
 
@@ -420,8 +447,26 @@ pub(super) fn build_entries(
                 vendor: None,
                 options: mount.options.clone(),
                 ownership: ownership_from_uids(&[mount_owner_uid(mount)], effective_user_ids().0),
+                fstab_line: None,
             });
         }
+    }
+
+    for mount in mounts.iter().filter(|mount| is_sshfs_fstype(&mount.fstype)) {
+        entries.push(UiEntry {
+            name: mount.source.clone(),
+            kind: "ssh".to_string(),
+            size_bytes: None,
+            mount_points: vec![mount.target.clone()],
+            fstype: Some(mount.fstype.clone()),
+            source: mount.source.clone(),
+            removable: false,
+            model: None,
+            vendor: None,
+            options: mount.options.clone(),
+            ownership: ownership_from_uids(&[mount_owner_uid(mount)], effective_user_ids().0),
+            fstab_line: None,
+        });
     }
 
     if show_pseudo {
@@ -444,6 +489,7 @@ pub(super) fn build_entries(
                 vendor: None,
                 options: m.options.clone(),
                 ownership: ownership_from_uids(&[mount_owner_uid(m)], effective_user_ids().0),
+                fstab_line: None,
             });
         }
     }
@@ -466,6 +512,52 @@ pub(super) fn build_entries(
 
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
+}
+
+pub(super) fn append_fstab_entries(
+    entries: &mut Vec<UiEntry>,
+    configured: &[FstabRecord],
+    mounts: &[MountEntry],
+    filter: &str,
+) {
+    let filter = filter.trim().to_lowercase();
+    for record in configured {
+        let entry = &record.entry;
+        let haystack = format!(
+            "{} {} {} {}",
+            entry.source,
+            entry.target,
+            entry.fstype,
+            entry.options.join(",")
+        )
+        .to_lowercase();
+        if !filter.is_empty() && !haystack.contains(&filter) {
+            continue;
+        }
+        let mounted = mounts
+            .iter()
+            .find(|mount| mount.target == entry.target)
+            .cloned();
+        let ownership = mounted
+            .as_ref()
+            .map(|mount| ownership_from_uids(&[mount_owner_uid(mount)], effective_user_ids().0))
+            .unwrap_or(Ownership::Unmounted);
+        entries.push(UiEntry {
+            name: entry.source.clone(),
+            kind: "fstab".to_string(),
+            size_bytes: None,
+            mount_points: vec![entry.target.clone()],
+            fstype: Some(entry.fstype.clone()),
+            source: entry.source.clone(),
+            removable: false,
+            model: None,
+            vendor: None,
+            options: entry.options.clone(),
+            ownership,
+            fstab_line: Some(record.line_index),
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.kind.cmp(&b.kind)));
 }
 
 pub(super) fn build_mount_map(mounts: &[MountEntry]) -> HashMap<String, Vec<&MountEntry>> {
@@ -605,6 +697,9 @@ pub(super) fn update_info_extra_on_selection(state: &mut AppState) {
 
 pub(super) fn selected_actions(state: &AppState) -> (bool, bool, bool) {
     if let Some(entry) = state.entries.get(state.selected) {
+        if entry.fstab_line.is_some() {
+            return (false, false, false);
+        }
         let mounted = !entry.mount_points.is_empty();
         (
             !mounted,
@@ -617,6 +712,9 @@ pub(super) fn selected_actions(state: &AppState) -> (bool, bool, bool) {
 }
 
 pub(super) fn mount_owner_uid(mount: &MountEntry) -> Option<u32> {
+    if is_sshfs_fstype(&mount.fstype) {
+        return mount_option_value(&mount.options, &["user_id"]).and_then(|uid| uid.parse().ok());
+    }
     if mount_tui::uses_mount_ownership(&mount.fstype) {
         // Synthetic-ownership filesystems default to root when no uid option
         // is present. Avoid stat on a remote SMB share, which may block if its
@@ -936,6 +1034,194 @@ pub(super) fn render_modal(f: &mut ratatui::Frame<'_>, state: &AppState, area: R
             let widget = Paragraph::new(lines)
                 .alignment(Alignment::Left)
                 .block(Block::default().title(title).borders(Borders::ALL));
+            f.render_widget(Clear, rect);
+            f.render_widget(widget, rect);
+        }
+        Modal::SshHosts { selected } => {
+            let mut items = vec![ListItem::new("Enter a host manually")];
+            items.extend(state.ssh_hosts.iter().map(|host| {
+                let details = if host.destination() == host.alias {
+                    String::new()
+                } else {
+                    format!("  ({})", host.destination())
+                };
+                ListItem::new(format!("{}{}", host.alias, details))
+            }));
+            let mut list_state = ratatui::widgets::ListState::default();
+            list_state.select(Some((*selected).min(items.len().saturating_sub(1))));
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .title("SSHFS: ~/.ssh/config hosts")
+                        .borders(Borders::ALL),
+                )
+                .highlight_style(Style::default().bg(Color::Blue).fg(Color::Black))
+                .highlight_symbol(" ");
+            f.render_widget(Clear, rect);
+            f.render_stateful_widget(list, rect, &mut list_state);
+        }
+        Modal::SshForm {
+            host,
+            remote_path,
+            target,
+            password,
+            opts,
+            permanent,
+            field,
+            cursor,
+        } => {
+            let invalid = ssh_form_error(host, remote_path, target);
+            let masked_password = "*".repeat(password.chars().count());
+            let permanent_candidate = password.is_empty() && ssh_identity_path(opts).is_some();
+            let lines = vec![
+                input_form_line(
+                    "SSH host *",
+                    host,
+                    "alias or user@hostname",
+                    *field == 0,
+                    *cursor,
+                    invalid.is_some_and(|error| error.0 == 0),
+                ),
+                input_form_line(
+                    "Remote path",
+                    remote_path,
+                    "/",
+                    *field == 1,
+                    *cursor,
+                    invalid.is_some_and(|error| error.0 == 1),
+                ),
+                input_form_line(
+                    "Mount target *",
+                    target,
+                    "/media/user/host",
+                    *field == 2,
+                    *cursor,
+                    invalid.is_some_and(|error| error.0 == 2),
+                ),
+                input_form_line(
+                    "Password/passphrase",
+                    &masked_password,
+                    "blank = SSH key/agent only",
+                    *field == 3,
+                    *cursor,
+                    false,
+                ),
+                input_form_line(
+                    "Mount options",
+                    opts,
+                    "comma-separated",
+                    *field == 4,
+                    *cursor,
+                    false,
+                ),
+                Line::from(vec![
+                    Span::styled(
+                        if *field == 5 { "> " } else { "  " },
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        if *permanent {
+                            "[x] Add to /etc/fstab (key verified)"
+                        } else {
+                            "[ ] Add to /etc/fstab (verified key required)"
+                        },
+                        if !permanent_candidate && !*permanent {
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM)
+                        } else if *field == 5 {
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        },
+                    ),
+                ]),
+                Line::from(
+                    "Blank password = key/agent auth; passwords are sent through stdin only",
+                ),
+                Line::from("Space: toggle permanent   Enter: next/mount   Esc: cancel"),
+            ];
+            let widget = Paragraph::new(lines).alignment(Alignment::Left).block(
+                Block::default()
+                    .title("Mount SSH filesystem")
+                    .borders(Borders::ALL),
+            );
+            f.render_widget(Clear, rect);
+            f.render_widget(widget, rect);
+        }
+        Modal::Export {
+            entry,
+            path,
+            cursor,
+            editing_path,
+        } => {
+            let mut lines = vec![
+                Line::from("Raw /etc/fstab entry:"),
+                Line::from(Span::styled(
+                    entry.render(),
+                    Style::default().fg(Color::LightCyan),
+                )),
+                Line::from(""),
+            ];
+            if *editing_path {
+                lines.push(editable_form_line("Export path", path, true, *cursor));
+                lines.push(Line::from("Enter: write new file   Esc: stop editing"));
+            } else {
+                lines.push(Line::from(format!("Export path: {path}")));
+                lines.push(Line::from(if is_sshfs_fstype(&entry.fstype) {
+                    "E: export to new file   P: unavailable (use h and verify a key)   Esc: close"
+                } else {
+                    "E: export to new file   P: append to /etc/fstab   Esc: close"
+                }));
+                lines.push(Line::from(
+                    "Existing export files and duplicate fstab entries are never overwritten.",
+                ));
+            }
+            let widget = Paragraph::new(lines)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title("Export / make permanent")
+                        .borders(Borders::ALL),
+                );
+            f.render_widget(Clear, rect);
+            f.render_widget(widget, rect);
+        }
+        Modal::FstabEdit { raw, cursor, .. } => {
+            let widget = Paragraph::new(vec![
+                Line::from("Edit one raw fstab entry. Fields are whitespace-separated."),
+                editable_form_line("Entry", raw, true, *cursor),
+                Line::from("Enter: validate and save   Esc: cancel"),
+                Line::from("The first edit creates /etc/fstab.mount-tui.bak."),
+            ])
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title("Edit /etc/fstab")
+                    .borders(Borders::ALL),
+            );
+            f.render_widget(Clear, rect);
+            f.render_widget(widget, rect);
+        }
+        Modal::ConfirmFstabRemove { raw, .. } => {
+            let widget = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Remove this /etc/fstab entry?",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(raw.clone()),
+                Line::from(""),
+                Line::from("Enter: remove   Esc: cancel"),
+                Line::from("The first change creates /etc/fstab.mount-tui.bak."),
+            ])
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title("Remove from /etc/fstab")
+                    .borders(Borders::ALL),
+            );
             f.render_widget(Clear, rect);
             f.render_widget(widget, rect);
         }

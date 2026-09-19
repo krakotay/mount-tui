@@ -5,7 +5,7 @@ use std::io;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::{ffi::CString, path::PathBuf};
 use thiserror::Error;
 
@@ -164,6 +164,107 @@ impl MountManager {
         result
     }
 
+    /// Mount an SSH filesystem through sshfs(1). Persistence-only fstab
+    /// options are removed before invoking the helper.
+    pub fn mount_sshfs(
+        source: &str,
+        target: &str,
+        options: &[String],
+        ssh_config: Option<&Path>,
+        password: Option<&str>,
+        run_as_user: Option<&str>,
+    ) -> Result<(), MountError> {
+        ensure_mount_target(target)?;
+        if source.contains(['\n', '\r']) || !source.contains(':') {
+            return Err(MountError::Other(
+                "SSHFS source must look like [user@]host:/path".to_string(),
+            ));
+        }
+        if password.is_some_and(|password| password.contains(['\n', '\r'])) {
+            return Err(MountError::Other(
+                "SSH password/passphrase must not contain a newline".to_string(),
+            ));
+        }
+        let mut runtime_options = runtime_sshfs_options(options);
+        if password.is_some() {
+            runtime_options.push("password_stdin".to_string());
+        } else if !runtime_options.iter().any(|option| {
+            option
+                .split_once('=')
+                .is_some_and(|(key, _)| key.eq_ignore_ascii_case("BatchMode"))
+        }) {
+            // Never let OpenSSH steal the TUI's raw terminal for a prompt.
+            // An empty password field means key/agent authentication only.
+            runtime_options.push("BatchMode=yes".to_string());
+        }
+        let mut command = command_as_user("sshfs", run_as_user)?;
+        if let Some(config) = ssh_config.filter(|path| path.is_file()) {
+            command.arg("-F").arg(config);
+        }
+        command.args([source, target]);
+        if !runtime_options.is_empty() {
+            command.args(["-o", &runtime_options.join(",")]);
+        }
+        if let Some(password) = password {
+            let mut input = password.as_bytes().to_vec();
+            input.push(b'\n');
+            let result = run_command_with_input(command, "sshfs", &input);
+            input.fill(0);
+            result
+        } else {
+            run_command(command, "sshfs")
+        }
+    }
+
+    /// Verify that the selected host accepts non-interactive key
+    /// authentication before allowing a boot-time fstab entry.
+    pub fn check_ssh_key(
+        host: &str,
+        options: &[String],
+        ssh_config: Option<&Path>,
+        run_as_user: Option<&str>,
+    ) -> Result<(), MountError> {
+        if host.is_empty() || host.contains(['\n', '\r']) {
+            return Err(MountError::Other("invalid SSH host".to_string()));
+        }
+        let mut command = command_as_user("sftp", run_as_user)?;
+        command.args(["-b", "/dev/null"]);
+        if let Some(config) = ssh_config.filter(|path| path.is_file()) {
+            command.arg("-F").arg(config);
+        }
+        command.args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "PreferredAuthentications=publickey",
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+        ]);
+        for option in options {
+            let key = option
+                .split_once('=')
+                .map_or(option.as_str(), |(key, _)| key);
+            if matches!(
+                key.to_ascii_lowercase().as_str(),
+                "port"
+                    | "identityfile"
+                    | "userknownhostsfile"
+                    | "stricthostkeychecking"
+                    | "proxyjump"
+            ) {
+                command.arg("-o").arg(option);
+            }
+        }
+        command.arg(host);
+        run_command(command, "SFTP key verification")
+    }
+
     /// Reconnect an existing SMB mount with credentials entered in the TUI.
     /// This avoids mount.cifs opening `/dev/tty` for its own password prompt,
     /// which is incompatible with the application's raw terminal mode.
@@ -222,6 +323,12 @@ impl MountManager {
         if is_smb_fstype(fstype) {
             return Err(MountError::Other(
                 "SMB access changes require reconnect_smb with credentials".to_string(),
+            ));
+        }
+        if is_sshfs_fstype(fstype) {
+            return Err(MountError::Other(
+                "SSHFS ownership is fixed when it is mounted; unmount it and reconnect from the SSH form"
+                    .to_string(),
             ));
         }
         if uses_mount_ownership(fstype) {
@@ -295,6 +402,18 @@ impl MountManager {
     }
 }
 
+fn runtime_sshfs_options(options: &[String]) -> Vec<String> {
+    options
+        .iter()
+        .filter(|option| {
+            !matches!(option.as_str(), "_netdev" | "nofail" | "noauto" | "auto")
+                && !option.starts_with("x-systemd.")
+                && !option.starts_with("ssh_command=")
+        })
+        .cloned()
+        .collect()
+}
+
 fn prepare_mount_options(opts: Option<&str>, mut flags: MountFlags) -> (MountFlags, Vec<&str>) {
     let mut data = Vec::new();
     for option in opts
@@ -357,11 +476,33 @@ pub fn is_smb_fstype(fstype: &str) -> bool {
     matches!(fstype, "cifs" | "smb3")
 }
 
+pub fn is_sshfs_fstype(fstype: &str) -> bool {
+    matches!(fstype, "fuse.sshfs" | "sshfs")
+}
+
 pub fn uses_mount_ownership(fstype: &str) -> bool {
     matches!(
         fstype,
         "cifs" | "smb3" | "vfat" | "exfat" | "ntfs" | "ntfs3"
     )
+}
+
+fn command_as_user(program: &str, user: Option<&str>) -> Result<Command, MountError> {
+    if user.is_some_and(|user| user.contains(['\n', '\r', '\0'])) {
+        return Err(MountError::Other("invalid local user name".to_string()));
+    }
+    if rustix::process::geteuid().is_root()
+        && let Some(user) = user.filter(|user| !user.is_empty() && *user != "root")
+    {
+        let runuser = ["/usr/sbin/runuser", "/usr/bin/runuser"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+            .unwrap_or("runuser");
+        let mut command = Command::new(runuser);
+        command.args(["-u", user, "--", program]);
+        return Ok(command);
+    }
+    Ok(Command::new(program))
 }
 
 pub fn ownership_options(fstype: &str, uid: u32, gid: u32) -> String {
@@ -553,6 +694,30 @@ fn sanitized_smb_options(opts: Option<&str>) -> Result<Vec<String>, MountError> 
 
 fn run_command(mut command: Command, program: &str) -> Result<(), MountError> {
     let output = command.output().map_err(MountError::Io)?;
+    command_output_result(output, program)
+}
+
+fn run_command_with_input(
+    mut command: Command,
+    program: &str,
+    input: &[u8],
+) -> Result<(), MountError> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(MountError::Io)?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| MountError::Other(format!("{program} stdin is unavailable")))?
+        .write_all(input)?;
+    let output = child.wait_with_output().map_err(MountError::Io)?;
+    command_output_result(output, program)
+}
+
+fn command_output_result(output: std::process::Output, program: &str) -> Result<(), MountError> {
     if output.status.success() {
         return Ok(());
     }
@@ -766,5 +931,21 @@ mod tests {
             "vers=3.1.1".to_string(),
         ];
         assert_eq!(reusable_smb_options(&existing), ["rw", "vers=3.1.1"]);
+    }
+
+    #[test]
+    fn sshfs_runtime_options_remove_only_fstab_controls() {
+        let options = vec![
+            "_netdev".to_string(),
+            "nofail".to_string(),
+            "x-systemd.automount".to_string(),
+            "reconnect".to_string(),
+            "IdentityFile=/home/alice/.ssh/id_ed25519".to_string(),
+            "ssh_command=ssh -F /home/alice/.ssh/config".to_string(),
+        ];
+        assert_eq!(
+            runtime_sshfs_options(&options),
+            ["reconnect", "IdentityFile=/home/alice/.ssh/id_ed25519"]
+        );
     }
 }

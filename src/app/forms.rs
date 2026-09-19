@@ -383,3 +383,230 @@ pub(super) fn media_mount_target(user: &str, name: &str) -> String {
         sanitize_mount_name(name)
     )
 }
+
+pub(super) fn ssh_form_value<'a>(
+    host: &'a str,
+    remote_path: &'a str,
+    target: &'a str,
+    password: &'a str,
+    opts: &'a str,
+    field: usize,
+) -> &'a str {
+    match field {
+        0 => host,
+        1 => remote_path,
+        2 => target,
+        3 => password,
+        4 => opts,
+        _ => "",
+    }
+}
+
+pub(super) fn ssh_form_value_mut<'a>(
+    host: &'a mut String,
+    remote_path: &'a mut String,
+    target: &'a mut String,
+    password: &'a mut String,
+    opts: &'a mut String,
+    field: usize,
+) -> &'a mut String {
+    match field {
+        0 => host,
+        1 => remote_path,
+        2 => target,
+        3 => password,
+        4 => opts,
+        _ => opts,
+    }
+}
+
+pub(super) fn default_ssh_form(host: Option<&SshHost>) -> (String, String, String, String) {
+    let host_name = host.map(|host| host.alias.clone()).unwrap_or_default();
+    let remote_path = "/".to_string();
+    let target = default_ssh_target(&host_name);
+    let (uid, gid) = effective_user_ids();
+    let mut options = vec![
+        "_netdev".to_string(),
+        "nofail".to_string(),
+        "reconnect".to_string(),
+        "ServerAliveInterval=15".to_string(),
+        "ServerAliveCountMax=3".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+        format!("uid={uid}"),
+        format!("gid={gid}"),
+    ];
+    if let Some(host) = host {
+        if let Some(port) = host.port {
+            options.push(format!("port={port}"));
+        }
+        if let Some(identity) = &host.identity_file {
+            options.push(format!("IdentityFile={}", identity.display()));
+        }
+    }
+    let home = effective_user_home();
+    if !options
+        .iter()
+        .any(|option| option.to_ascii_lowercase().starts_with("identityfile="))
+        && let Some(identity) = ["id_ed25519", "id_ecdsa", "id_rsa"]
+            .into_iter()
+            .map(|name| home.join(".ssh").join(name))
+            .find(|path| path.is_file())
+    {
+        options.push(format!("IdentityFile={}", identity.display()));
+    }
+    if options
+        .iter()
+        .any(|option| option.to_ascii_lowercase().starts_with("identityfile="))
+    {
+        options.push("IdentitiesOnly=yes".to_string());
+    }
+    options.push(format!(
+        "UserKnownHostsFile={}",
+        home.join(".ssh/known_hosts").display()
+    ));
+    (host_name, remote_path, target, options.join(","))
+}
+
+pub(super) fn ssh_identity_path(options: &str) -> Option<std::path::PathBuf> {
+    options.split(',').find_map(|option| {
+        let (key, value) = option.trim().split_once('=')?;
+        (key.eq_ignore_ascii_case("IdentityFile") && !value.is_empty())
+            .then(|| std::path::PathBuf::from(value))
+    })
+}
+
+pub(super) fn boot_ssh_identity(options: &str) -> Result<std::path::PathBuf, String> {
+    let identity = ssh_identity_path(options)
+        .ok_or_else(|| "No private IdentityFile is configured for this host".to_string())?;
+    if !identity.is_file() {
+        return Err(format!(
+            "SSH private key does not exist: {}",
+            identity.display()
+        ));
+    }
+    let output = Command::new("ssh-keygen")
+        .args(["-y", "-P", "", "-f"])
+        .arg(&identity)
+        .output()
+        .map_err(|error| format!("could not validate SSH key: {error}"))?;
+    if !output.status.success() {
+        return Err(
+            "The SSH key is invalid or needs a passphrase, so it cannot mount unattended at boot"
+                .to_string(),
+        );
+    }
+    Ok(identity)
+}
+
+pub(super) fn default_ssh_target(host: &str) -> String {
+    let name = host
+        .trim()
+        .rsplit('@')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("ssh");
+    media_mount_target(&effective_user_name(), name)
+}
+
+pub(super) fn ssh_form_error(
+    host: &str,
+    remote_path: &str,
+    target: &str,
+) -> Option<(usize, &'static str)> {
+    if host.trim().is_empty() || host.contains(char::is_whitespace) {
+        return Some((0, "SSH host is required and must not contain whitespace"));
+    }
+    if remote_path.contains(['\n', '\r']) {
+        return Some((1, "Remote path must be a single line"));
+    }
+    if target.trim().is_empty() || !Path::new(target).is_absolute() {
+        return Some((2, "Mount target must be an absolute path"));
+    }
+    None
+}
+
+pub(super) fn fstab_entry_for_ui(entry: &UiEntry) -> io::Result<FstabEntry> {
+    let mounted = !entry.mount_points.is_empty();
+    let target = entry
+        .mount_points
+        .first()
+        .cloned()
+        .unwrap_or_else(|| default_mount_target(&entry.source));
+    let fstype = entry
+        .fstype
+        .clone()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "auto".to_string());
+    let source = if entry.source.starts_with("/dev/") {
+        udev_data_for_device(&entry.source)
+            .and_then(|data| data.get("ID_FS_UUID").cloned())
+            .map(|uuid| format!("UUID={uuid}"))
+            .unwrap_or_else(|| entry.source.clone())
+    } else {
+        entry.source.clone()
+    };
+    let mut options = if mounted {
+        reusable_fstab_options(&entry.options)
+    } else {
+        default_mount_opts(&fstype)
+            .split(',')
+            .filter(|option| !option.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    if (is_smb_fstype(&fstype) || is_sshfs_fstype(&fstype))
+        && !options.iter().any(|option| option == "_netdev")
+    {
+        options.push("_netdev".to_string());
+    }
+    FstabEntry::new(source, target, fstype, options)
+}
+
+pub(super) fn reusable_fstab_options(options: &[String]) -> Vec<String> {
+    let mut reusable = Vec::new();
+    for option in options {
+        let key = option
+            .split_once('=')
+            .map_or(option.as_str(), |(key, _)| key);
+        if matches!(
+            key,
+            "password" | "pass" | "credentials" | "addr" | "ip" | "unc" | "user_id" | "group_id"
+        ) {
+            continue;
+        }
+        if !reusable.contains(option) {
+            reusable.push(option.clone());
+        }
+    }
+    if reusable.is_empty() {
+        reusable.push("defaults".to_string());
+    }
+    reusable
+}
+
+pub(super) fn ssh_source(host: &str, remote_path: &str) -> String {
+    let path = if remote_path.trim().is_empty() {
+        "/"
+    } else {
+        remote_path.trim()
+    };
+    format!("{}:{path}", host.trim())
+}
+
+pub(super) fn ssh_persistent_options(options: &[String]) -> Vec<String> {
+    let mut options = options.to_vec();
+    for required in ["allow_other", "default_permissions"] {
+        if !options.iter().any(|option| option == required) {
+            options.push(required.to_string());
+        }
+    }
+    let config = effective_user_home().join(".ssh/config");
+    if config.is_file()
+        && !options
+            .iter()
+            .any(|option| option.starts_with("ssh_command="))
+    {
+        options.push(format!("ssh_command=ssh -F {}", config.display()));
+    }
+    options
+}

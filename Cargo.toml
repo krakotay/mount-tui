@@ -1,7 +1,7 @@
 [package]
 name = "mount-tui"
-description = "Interactive Linux TUI for mounting local filesystems and SMB shares"
-version = "0.6.0"
+description = "Interactive Linux TUI for mounting local, SMB, and SSH filesystems"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -12,7 +12,7 @@ readme = "README.md"
 [package.metadata.deb]
 section = "utils"
 priority = "optional"
-depends = "$auto, cifs-utils"
+depends = "$auto, cifs-utils, sshfs"
 assets = [
     ["target/release/mount-tui", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/mount-tui/README.md", "644"],
@@ -30,6 +30,7 @@ assets = [
 
 [package.metadata.generate-rpm.requires]
 cifs-utils = "*"
+fuse-sshfs = "*"
 
 [dependencies]
 anyhow = "1.0.104"

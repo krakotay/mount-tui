@@ -5,7 +5,22 @@ pub(super) fn is_root() -> bool {
 }
 
 pub(super) fn device_info_lines(entry: &UiEntry) -> Vec<String> {
-    if entry.fstype.as_deref().is_some_and(is_smb_fstype) {
+    if entry.fstab_line.is_some() {
+        return vec![
+            format!("fstab line: {}", entry.fstab_line.unwrap_or_default() + 1),
+            format!("Source: {}", entry.source),
+            format!(
+                "Target: {}",
+                entry.mount_points.first().map_or("-", String::as_str)
+            ),
+            format!("Options: {}", display_mount_options(&entry.options)),
+        ];
+    }
+    if entry
+        .fstype
+        .as_deref()
+        .is_some_and(|fstype| is_smb_fstype(fstype) || is_sshfs_fstype(fstype))
+    {
         let mut out = vec![format!("Share: {}", entry.source)];
         out.extend(
             entry
@@ -205,6 +220,73 @@ pub(super) fn effective_user_name() -> String {
         .map(|(name, _, _)| name)
         .or_else(|| env::var("USER").ok())
         .unwrap_or_else(|| uid.to_string())
+}
+
+pub(super) fn effective_user_home() -> std::path::PathBuf {
+    let (uid, _) = effective_user_ids();
+    fs::read_to_string("/etc/passwd")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| {
+            let fields = line.split(':').collect::<Vec<_>>();
+            (fields.len() >= 6 && fields[2].parse::<u32>().ok() == Some(uid))
+                .then(|| std::path::PathBuf::from(fields[5]))
+        })
+        .or_else(|| env::var_os("HOME").map(std::path::PathBuf::from))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+}
+
+pub(super) fn prepare_user_known_hosts() -> io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let home = effective_user_home();
+    let ssh_dir = home.join(".ssh");
+    let created_dir = !ssh_dir.exists();
+    fs::create_dir_all(&ssh_dir)?;
+    if created_dir {
+        fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700))?;
+    }
+
+    let known_hosts = ssh_dir.join("known_hosts");
+    let created_file = !known_hosts.exists();
+    if created_file {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&known_hosts)?;
+    }
+
+    let (uid, gid) = effective_user_ids();
+    if is_root() && uid != 0 {
+        if created_dir {
+            rustix::fs::chown(
+                &ssh_dir,
+                Some(rustix::process::Uid::from_raw(uid)),
+                Some(rustix::process::Gid::from_raw(gid)),
+            )?;
+        }
+        if created_file {
+            rustix::fs::chown(
+                &known_hosts,
+                Some(rustix::process::Uid::from_raw(uid)),
+                Some(rustix::process::Gid::from_raw(gid)),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn prepare_ssh_mount_target(target: &Path) -> Result<(), mount_tui::MountError> {
+    let (uid, gid) = effective_user_ids();
+    if is_root() && uid != 0 {
+        rustix::fs::chown(
+            target,
+            Some(rustix::process::Uid::from_raw(uid)),
+            Some(rustix::process::Gid::from_raw(gid)),
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn passwd_entries() -> impl Iterator<Item = (String, u32, u32)> {

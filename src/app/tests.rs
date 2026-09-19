@@ -72,6 +72,95 @@ fn smb_mounts_participate_in_filtering() {
 }
 
 #[test]
+fn sshfs_mounts_are_visible_and_filterable() {
+    let mounts = vec![MountEntry {
+        source: "media:/srv/music".to_string(),
+        target: "/media/alice/media".to_string(),
+        fstype: "fuse.sshfs".to_string(),
+        options: vec!["rw".to_string(), "uid=1000".to_string()],
+    }];
+
+    let entries = build_entries(&mounts, &[], false, true, true, true, "media");
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, "ssh");
+    assert_eq!(entries[0].source, "media:/srv/music");
+    assert_eq!(entries[0].mount_points, ["/media/alice/media"]);
+}
+
+#[test]
+fn sshfs_owner_uses_fuse_user_id_instead_of_replaying_it_as_a_mount_option() {
+    let mount = MountEntry {
+        source: "media:/srv/music".to_string(),
+        target: "/media/alice/media".to_string(),
+        fstype: "fuse.sshfs".to_string(),
+        options: vec!["rw".to_string(), "user_id=1000".to_string()],
+    };
+    assert_eq!(mount_owner_uid(&mount), Some(1000));
+    assert!(!mount_tui::uses_mount_ownership("fuse.sshfs"));
+}
+
+#[test]
+fn fstab_entries_are_only_added_to_the_list_when_requested() {
+    let configured = vec![FstabRecord {
+        line_index: 3,
+        entry: FstabEntry::new(
+            "UUID=abc",
+            "/mnt/archive",
+            "ext4",
+            vec!["defaults".to_string()],
+        )
+        .unwrap(),
+    }];
+    let mut entries = Vec::new();
+    append_fstab_entries(&mut entries, &configured, &[], "");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, "fstab");
+    assert_eq!(entries[0].fstab_line, Some(3));
+    assert_eq!(entries[0].mount_points, ["/mnt/archive"]);
+}
+
+#[test]
+fn ssh_source_defaults_to_remote_root() {
+    assert_eq!(ssh_source("alice@example.test", ""), "alice@example.test:/");
+    assert_eq!(ssh_source("media", "/srv/music"), "media:/srv/music");
+}
+
+#[test]
+fn ssh_identity_is_read_from_mount_options_case_insensitively() {
+    assert_eq!(
+        ssh_identity_path("reconnect,identityfile=/home/alice/.ssh/id_ed25519"),
+        Some(std::path::PathBuf::from("/home/alice/.ssh/id_ed25519"))
+    );
+    assert!(ssh_identity_path("reconnect,uid=1000").is_none());
+}
+
+#[test]
+fn permanent_ssh_mounts_allow_the_original_user_through_root_owned_fuse() {
+    let options = ssh_persistent_options(&[
+        "uid=1000".to_string(),
+        "gid=1000".to_string(),
+        "_netdev".to_string(),
+    ]);
+    assert!(options.iter().any(|option| option == "allow_other"));
+    assert!(options.iter().any(|option| option == "default_permissions"));
+    assert!(options.iter().any(|option| option == "uid=1000"));
+    assert!(options.iter().any(|option| option == "gid=1000"));
+}
+
+#[test]
+fn fstab_reuse_removes_secrets_and_transient_network_values() {
+    let options = vec![
+        "rw".to_string(),
+        "password=secret".to_string(),
+        "credentials=/run/temporary".to_string(),
+        "addr=192.0.2.10".to_string(),
+        "vers=3.1.1".to_string(),
+    ];
+    assert_eq!(reusable_fstab_options(&options), ["rw", "vers=3.1.1"]);
+}
+
+#[test]
 fn secret_mount_options_are_redacted() {
     let options = vec![
         "rw".to_string(),
@@ -104,6 +193,7 @@ fn reconnect_form_uses_existing_smb_identity_and_writable_user_options() {
             "uid=0".to_string(),
         ],
         ownership: Ownership::Other(0),
+        fstab_line: None,
     };
 
     let (source, target, username, domain, options) = smb_reconnect_fields(&entry);

@@ -4,7 +4,9 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use mount_tui::{
-    BlockDevice, MountEntry, MountManager, UserAccessMethod, is_smb_fstype, ownership_options,
+    BlockDevice, FstabEntry, FstabRecord, MountEntry, MountManager, SshHost, UserAccessMethod,
+    is_smb_fstype, is_sshfs_fstype, ownership_options, read_fstab, read_ssh_config,
+    remove_fstab_entry, replace_fstab_entry,
 };
 use ratatui::{
     Terminal,
@@ -54,6 +56,7 @@ struct UiEntry {
     vendor: Option<String>,
     options: Vec<String>,
     ownership: Ownership,
+    fstab_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +92,9 @@ struct AppState {
     modal: Modal,
     info_extra: Vec<String>,
     info_extra_visible: bool,
+    ssh_hosts: Vec<SshHost>,
+    fstab_entries: Vec<FstabRecord>,
+    show_fstab: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +140,35 @@ enum Modal {
         field: usize,
         cursor: usize,
         previous_mount: Option<MountEntry>,
+    },
+    SshHosts {
+        selected: usize,
+    },
+    SshForm {
+        host: String,
+        remote_path: String,
+        target: String,
+        password: String,
+        opts: String,
+        permanent: bool,
+        field: usize,
+        cursor: usize,
+    },
+    Export {
+        entry: FstabEntry,
+        path: String,
+        cursor: usize,
+        editing_path: bool,
+    },
+    FstabEdit {
+        line_index: usize,
+        original: String,
+        raw: String,
+        cursor: usize,
+    },
+    ConfirmFstabRemove {
+        line_index: usize,
+        raw: String,
     },
 }
 mod editor;
@@ -204,6 +239,9 @@ fn init_state() -> anyhow::Result<AppState> {
         modal: Modal::None,
         info_extra: Vec::new(),
         info_extra_visible: false,
+        ssh_hosts: read_ssh_config(&effective_user_home()).unwrap_or_default(),
+        fstab_entries: read_fstab(Path::new("/etc/fstab")).unwrap_or_default(),
+        show_fstab: false,
     };
     rebuild_entries(&mut state);
     Ok(state)
@@ -219,6 +257,14 @@ fn rebuild_entries(state: &mut AppState) {
         state.show_partitions,
         &state.filter,
     );
+    if state.show_fstab {
+        append_fstab_entries(
+            &mut state.entries,
+            &state.fstab_entries,
+            &state.mounts,
+            &state.filter,
+        );
+    }
     if state.selected >= state.entries.len() {
         state.selected = state.entries.len().saturating_sub(1);
     }
@@ -265,6 +311,8 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
         KeyCode::Char('r') => {
             state.mounts = MountManager::list_mounts().unwrap_or_default();
             state.devices = MountManager::list_block_devices().unwrap_or_default();
+            state.ssh_hosts = read_ssh_config(&effective_user_home()).unwrap_or_default();
+            state.fstab_entries = read_fstab(Path::new("/etc/fstab")).unwrap_or_default();
             state.last_refresh = SystemTime::now();
             rebuild_entries(state);
             state.status = "Refreshed".to_string();
@@ -275,6 +323,16 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
         KeyCode::Char('p') => {
             state.show_pseudo = !state.show_pseudo;
             rebuild_entries(state);
+        }
+        KeyCode::Char('b') => {
+            state.show_fstab = !state.show_fstab;
+            state.fstab_entries = read_fstab(Path::new("/etc/fstab")).unwrap_or_default();
+            rebuild_entries(state);
+            state.status = if state.show_fstab {
+                "fstab entries are visible; e edits and Delete removes".to_string()
+            } else {
+                "fstab entries are hidden".to_string()
+            };
         }
         KeyCode::Char('d') => {
             state.show_disks = !state.show_disks;
@@ -292,7 +350,10 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
         KeyCode::End => select_last(state),
         KeyCode::Char('u') => {
             if let Some(entry) = state.entries.get(state.selected) {
-                if !entry.mount_points.is_empty() {
+                if entry.fstab_line.is_some() {
+                    state.status =
+                        "This is an fstab configuration entry, not a live mount".to_string();
+                } else if !entry.mount_points.is_empty() {
                     if !is_root() {
                         state.modal = Modal::NeedRoot;
                     } else {
@@ -308,7 +369,11 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
         }
         KeyCode::Char('m') => {
             if let Some(entry) = state.entries.get(state.selected) {
-                if !entry.mount_points.is_empty() {
+                if entry.fstab_line.is_some() {
+                    state.status =
+                        "Edit the fstab entry with e; mounting configured entries is not automatic"
+                            .to_string();
+                } else if !entry.mount_points.is_empty() {
                     state.status = "Already mounted (use unmount)".to_string();
                 } else if !is_root() {
                     state.modal = Modal::NeedRoot;
@@ -353,9 +418,76 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool> {
                 };
             }
         }
+        KeyCode::Char('h') => {
+            if !is_root() {
+                state.modal = Modal::NeedRoot;
+            } else {
+                state.modal = Modal::SshHosts { selected: 0 };
+            }
+        }
+        KeyCode::Char('x') => {
+            if let Some(entry) = state.entries.get(state.selected) {
+                let fstab_entry = entry
+                    .fstab_line
+                    .and_then(|line| {
+                        state
+                            .fstab_entries
+                            .iter()
+                            .find(|record| record.line_index == line)
+                    })
+                    .map(|record| Ok(record.entry.clone()))
+                    .unwrap_or_else(|| fstab_entry_for_ui(entry));
+                match fstab_entry {
+                    Ok(entry) => {
+                        let path = effective_user_home().join("mount-tui-fstab.txt");
+                        let path = path.to_string_lossy().to_string();
+                        state.modal = Modal::Export {
+                            cursor: path.chars().count(),
+                            entry,
+                            path,
+                            editing_path: false,
+                        };
+                    }
+                    Err(error) => state.status = format!("export failed: {error}"),
+                }
+            }
+        }
+        KeyCode::Char('e') => {
+            if let Some(entry) = state.entries.get(state.selected)
+                && let Some(line_index) = entry.fstab_line
+                && let Some(record) = state
+                    .fstab_entries
+                    .iter()
+                    .find(|record| record.line_index == line_index)
+            {
+                let raw = record.entry.render();
+                state.modal = Modal::FstabEdit {
+                    cursor: raw.chars().count(),
+                    line_index,
+                    original: raw.clone(),
+                    raw,
+                };
+            }
+        }
+        KeyCode::Delete => {
+            if let Some(entry) = state.entries.get(state.selected)
+                && let Some(line_index) = entry.fstab_line
+                && let Some(record) = state
+                    .fstab_entries
+                    .iter()
+                    .find(|record| record.line_index == line_index)
+            {
+                state.modal = Modal::ConfirmFstabRemove {
+                    line_index,
+                    raw: record.entry.render(),
+                };
+            }
+        }
         KeyCode::Char('a') => {
             if let Some(entry) = state.entries.get(state.selected) {
-                if entry.mount_points.is_empty() {
+                if entry.fstab_line.is_some() {
+                    state.status = "Edit ownership options in this fstab entry with e".to_string();
+                } else if entry.mount_points.is_empty() {
                     state.status = "Mount the filesystem first".to_string();
                 } else if entry.ownership == Ownership::CurrentUser {
                     state.status = format!(
@@ -820,6 +952,361 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> anyhow::Result<bool>
                     state.status.clear();
                 }
             }
+        },
+        Modal::SshHosts { selected } => match key.code {
+            KeyCode::Esc => state.modal = Modal::None,
+            KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Down => {
+                *selected = (*selected + 1).min(state.ssh_hosts.len());
+            }
+            KeyCode::Enter => {
+                let configured = selected
+                    .checked_sub(1)
+                    .and_then(|index| state.ssh_hosts.get(index));
+                let (host, remote_path, target, opts) = default_ssh_form(configured);
+                state.modal = Modal::SshForm {
+                    cursor: host.chars().count(),
+                    host,
+                    remote_path,
+                    target,
+                    password: String::new(),
+                    opts,
+                    permanent: false,
+                    field: 0,
+                };
+            }
+            _ => {}
+        },
+        Modal::SshForm {
+            host,
+            remote_path,
+            target,
+            password,
+            opts,
+            permanent,
+            field,
+            cursor,
+        } => match key.code {
+            KeyCode::Esc => state.modal = Modal::None,
+            KeyCode::Tab => {
+                *field = (*field + 1) % 6;
+                *cursor = ssh_form_value(host, remote_path, target, password, opts, *field)
+                    .chars()
+                    .count();
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                *field = field.saturating_sub(1);
+                *cursor = ssh_form_value(host, remote_path, target, password, opts, *field)
+                    .chars()
+                    .count();
+            }
+            KeyCode::Down => {
+                *field = (*field + 1).min(5);
+                *cursor = ssh_form_value(host, remote_path, target, password, opts, *field)
+                    .chars()
+                    .count();
+            }
+            KeyCode::Char(' ') if *field == 5 => {
+                if *permanent {
+                    *permanent = false;
+                    state.status = "Permanent SSH mount disabled".to_string();
+                } else if !password.is_empty() {
+                    *permanent = false;
+                    state.status =
+                        "Password authentication cannot be stored in /etc/fstab; clear the password and use a key"
+                            .to_string();
+                } else if let Err(error) = boot_ssh_identity(opts) {
+                    *permanent = false;
+                    state.status = error;
+                } else if let Err(error) = prepare_user_known_hosts() {
+                    *permanent = false;
+                    state.status = format!("known_hosts setup failed: {error}");
+                } else {
+                    let options = opts
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|option| !option.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    let config = effective_user_home().join(".ssh/config");
+                    let local_user = effective_user_name();
+                    match MountManager::check_ssh_key(
+                        host,
+                        &options,
+                        Some(&config),
+                        Some(&local_user),
+                    ) {
+                        Ok(()) => {
+                            *permanent = true;
+                            state.status = "SSH key verified; /etc/fstab is enabled".to_string();
+                        }
+                        Err(error) => {
+                            *permanent = false;
+                            state.status = format!(
+                                "SSH key verification failed; /etc/fstab stays disabled: {error}"
+                            );
+                        }
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                if *field < 5 {
+                    if *field == 0 && *target == default_ssh_target("") {
+                        *target = default_ssh_target(host);
+                    }
+                    *field += 1;
+                    *cursor = ssh_form_value(host, remote_path, target, password, opts, *field)
+                        .chars()
+                        .count();
+                    return Ok(false);
+                }
+                if let Some((invalid_field, message)) = ssh_form_error(host, remote_path, target) {
+                    *field = invalid_field;
+                    *cursor = ssh_form_value(host, remote_path, target, password, opts, *field)
+                        .chars()
+                        .count();
+                    state.status = message.to_string();
+                    return Ok(false);
+                }
+                if !password.is_empty() {
+                    *permanent = false;
+                }
+                if !Path::new(target.as_str()).exists()
+                    && let Err(error) = fs::create_dir_all(target.as_str())
+                {
+                    state.status = format!("mkdir failed: {error}");
+                    state.modal = Modal::None;
+                    return Ok(false);
+                }
+                if let Err(error) = prepare_ssh_mount_target(Path::new(target.as_str())) {
+                    state.status = format!("SSH mount target setup failed: {error}");
+                    return Ok(false);
+                }
+                let source = ssh_source(host, remote_path);
+                let options = opts
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|option| !option.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                let config = effective_user_home().join(".ssh/config");
+                if let Err(error) = prepare_user_known_hosts() {
+                    state.status = format!("known_hosts setup failed: {error}");
+                    return Ok(false);
+                }
+                let password_arg = (!password.is_empty()).then_some(password.as_str());
+                let local_user = effective_user_name();
+                let result = MountManager::mount_sshfs(
+                    &source,
+                    target,
+                    &options,
+                    Some(&config),
+                    password_arg,
+                    Some(&local_user),
+                );
+                password.clear();
+                match result {
+                    Ok(()) => {
+                        let mut status = format!("Mounted SSH filesystem {source}");
+                        if *permanent {
+                            match FstabEntry::new(
+                                source.clone(),
+                                target.clone(),
+                                "fuse.sshfs",
+                                ssh_persistent_options(&options),
+                            )
+                            .and_then(|entry| entry.append_to(Path::new("/etc/fstab")))
+                            {
+                                Ok(()) => status.push_str(" and added it to /etc/fstab"),
+                                Err(error) => {
+                                    status = format!(
+                                        "Mounted SSH filesystem, but /etc/fstab update failed: {error}"
+                                    )
+                                }
+                            }
+                        }
+                        state.mounts = MountManager::list_mounts().unwrap_or_default();
+                        rebuild_entries(state);
+                        state.status = status;
+                        state.modal = Modal::None;
+                    }
+                    Err(error) => {
+                        *permanent = false;
+                        *field = 3;
+                        *cursor = 0;
+                        state.status = format!("SSHFS mount failed: {error}");
+                    }
+                }
+            }
+            _ if *field < 5
+                && handle_line_editor_key(
+                    ssh_form_value_mut(host, remote_path, target, password, opts, *field),
+                    cursor,
+                    key,
+                ) =>
+            {
+                if *field == 3 && !password.is_empty() {
+                    *permanent = false;
+                }
+                state.status.clear();
+            }
+            _ => {}
+        },
+        Modal::Export {
+            entry,
+            path,
+            cursor,
+            editing_path,
+        } => {
+            if *editing_path {
+                match key.code {
+                    KeyCode::Esc => *editing_path = false,
+                    KeyCode::Enter => {
+                        let export_path = path.clone();
+                        match entry.export_new(Path::new(&export_path)) {
+                            Ok(()) => {
+                                let (uid, gid) = effective_user_ids();
+                                if is_root() && uid != 0 {
+                                    let _ = rustix::fs::chown(
+                                        export_path.as_str(),
+                                        Some(rustix::process::Uid::from_raw(uid)),
+                                        Some(rustix::process::Gid::from_raw(gid)),
+                                    );
+                                }
+                                state.status = format!("Exported fstab entry to {export_path}")
+                            }
+                            Err(error) => state.status = format!("export failed: {error}"),
+                        }
+                        *editing_path = false;
+                    }
+                    _ => {
+                        handle_line_editor_key(path, cursor, key);
+                    }
+                }
+            } else {
+                match key.code {
+                    KeyCode::Esc => state.modal = Modal::None,
+                    KeyCode::Char('e' | 'E') => {
+                        *editing_path = true;
+                        *cursor = path.chars().count();
+                    }
+                    KeyCode::Char('p' | 'P') => {
+                        if is_sshfs_fstype(&entry.fstype) {
+                            state.status =
+                                "SSH /etc/fstab entries require verified key authentication; use the h SSH form"
+                                    .to_string();
+                        } else if !is_root() {
+                            state.status =
+                                "Adding to /etc/fstab requires root; restart with sudo".to_string();
+                        } else {
+                            if !Path::new(&entry.target).exists()
+                                && let Err(error) = fs::create_dir_all(&entry.target)
+                            {
+                                state.status = format!("mkdir failed: {error}");
+                                return Ok(false);
+                            }
+                            match entry.append_to(Path::new("/etc/fstab")) {
+                                Ok(()) => {
+                                    state.status = format!(
+                                        "Added {} on {} to /etc/fstab",
+                                        entry.source, entry.target
+                                    );
+                                    state.modal = Modal::None;
+                                }
+                                Err(error) => {
+                                    state.status = format!("fstab update failed: {error}")
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Modal::FstabEdit {
+            line_index,
+            original,
+            raw,
+            cursor,
+        } => match key.code {
+            KeyCode::Esc => state.modal = Modal::None,
+            KeyCode::Enter => {
+                if !is_root() {
+                    state.status =
+                        "Editing /etc/fstab requires root; restart with sudo".to_string();
+                    return Ok(false);
+                }
+                let current = read_fstab(Path::new("/etc/fstab")).and_then(|records| {
+                    records
+                        .into_iter()
+                        .find(|record| record.line_index == *line_index)
+                        .map(|record| record.entry.render())
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::NotFound, "fstab entry disappeared")
+                        })
+                });
+                let result = current.and_then(|current| {
+                    if current != *original {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "fstab changed on disk; refresh and try again",
+                        ));
+                    }
+                    FstabEntry::parse(raw).and_then(|entry| {
+                        replace_fstab_entry(Path::new("/etc/fstab"), *line_index, &entry)
+                    })
+                });
+                match result {
+                    Ok(()) => {
+                        state.fstab_entries =
+                            read_fstab(Path::new("/etc/fstab")).unwrap_or_default();
+                        rebuild_entries(state);
+                        state.status =
+                            "Updated /etc/fstab (backup: /etc/fstab.mount-tui.bak)".to_string();
+                        state.modal = Modal::None;
+                    }
+                    Err(error) => state.status = format!("fstab edit failed: {error}"),
+                }
+            }
+            _ => {
+                handle_line_editor_key(raw, cursor, key);
+            }
+        },
+        Modal::ConfirmFstabRemove { line_index, raw } => match key.code {
+            KeyCode::Esc => state.modal = Modal::None,
+            KeyCode::Enter => {
+                if !is_root() {
+                    state.status =
+                        "Removing from /etc/fstab requires root; restart with sudo".to_string();
+                    return Ok(false);
+                }
+                let unchanged = read_fstab(Path::new("/etc/fstab")).and_then(|records| {
+                    records
+                        .into_iter()
+                        .find(|record| record.line_index == *line_index)
+                        .filter(|record| record.entry.render() == *raw)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "fstab changed on disk; refresh and try again",
+                            )
+                        })
+                });
+                match unchanged
+                    .and_then(|_| remove_fstab_entry(Path::new("/etc/fstab"), *line_index))
+                {
+                    Ok(()) => {
+                        state.fstab_entries =
+                            read_fstab(Path::new("/etc/fstab")).unwrap_or_default();
+                        rebuild_entries(state);
+                        state.status =
+                            "Removed fstab entry (backup: /etc/fstab.mount-tui.bak)".to_string();
+                        state.modal = Modal::None;
+                    }
+                    Err(error) => state.status = format!("fstab removal failed: {error}"),
+                }
+            }
+            _ => {}
         },
         Modal::None => {}
     }
