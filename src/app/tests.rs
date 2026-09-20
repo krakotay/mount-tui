@@ -1,11 +1,30 @@
 use super::*;
 
 #[test]
-fn ntfs_defaults_to_ntfs_3g_and_can_switch_to_kernel_driver() {
-    assert_eq!(preferred_mount_fstype("ntfs"), "ntfs-3g");
-    assert_eq!(preferred_mount_fstype("ntfs3"), "ntfs-3g");
-    assert_eq!(toggled_ntfs_driver("ntfs-3g"), "ntfs3");
-    assert_eq!(toggled_ntfs_driver("ntfs3"), "ntfs-3g");
+fn new_ntfs_driver_is_preferred_and_cycles_through_existing_alternatives() {
+    assert_eq!(preferred_mount_fstype_for("ntfs", true), "ntfs");
+    assert_eq!(preferred_mount_fstype_for("ntfs3", true), "ntfs");
+    assert_eq!(toggled_ntfs_driver_for("ntfs", true), "ntfs3");
+    assert_eq!(toggled_ntfs_driver_for("ntfs3", true), "ntfs-3g");
+    assert_eq!(toggled_ntfs_driver_for("ntfs-3g", true), "ntfs");
+}
+
+#[test]
+fn unavailable_new_ntfs_driver_keeps_the_previous_scheme() {
+    assert_eq!(preferred_mount_fstype_for("ntfs", false), "ntfs-3g");
+    assert_eq!(preferred_mount_fstype_for("ntfs3", false), "ntfs-3g");
+    assert_eq!(toggled_ntfs_driver_for("ntfs-3g", false), "ntfs3");
+    assert_eq!(toggled_ntfs_driver_for("ntfs3", false), "ntfs-3g");
+}
+
+#[test]
+fn new_ntfs_driver_requires_kernel_7_1_or_newer() {
+    assert!(!kernel_release_supports_new_ntfs("6.17.9-generic"));
+    assert!(!kernel_release_supports_new_ntfs("7.0.12"));
+    assert!(kernel_release_supports_new_ntfs("7.1.0-rc1"));
+    assert!(kernel_release_supports_new_ntfs("7.1.15-76070105-generic"));
+    assert!(kernel_release_supports_new_ntfs("8.0.0"));
+    assert!(!kernel_release_supports_new_ntfs("not-a-kernel"));
 }
 
 #[test]

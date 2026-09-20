@@ -1,4 +1,7 @@
 use super::*;
+use std::sync::OnceLock;
+
+static NEW_NTFS_DRIVER_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 pub(super) fn is_root() -> bool {
     rustix::process::geteuid().is_root()
@@ -147,7 +150,12 @@ pub(super) fn detected_fstype(dev_path: &str) -> Option<String> {
 }
 
 pub(super) fn preferred_mount_fstype(detected: &str) -> &str {
+    preferred_mount_fstype_for(detected, new_ntfs_driver_available())
+}
+
+pub(super) fn preferred_mount_fstype_for(detected: &str, new_ntfs_available: bool) -> &str {
     match detected {
+        "ntfs" | "ntfs3" | "ntfs-3g" if new_ntfs_available => "ntfs",
         "ntfs" | "ntfs3" | "ntfs-3g" => "ntfs-3g",
         other => other,
     }
@@ -158,11 +166,66 @@ pub(super) fn is_ntfs_driver(fstype: &str) -> bool {
 }
 
 pub(super) fn toggled_ntfs_driver(fstype: &str) -> &'static str {
-    if fstype == "ntfs3" {
+    toggled_ntfs_driver_for(fstype, new_ntfs_driver_available())
+}
+
+pub(super) fn toggled_ntfs_driver_for(fstype: &str, new_ntfs_available: bool) -> &'static str {
+    if new_ntfs_available {
+        match fstype {
+            "ntfs" => "ntfs3",
+            "ntfs3" => "ntfs-3g",
+            _ => "ntfs",
+        }
+    } else if fstype == "ntfs3" {
         "ntfs-3g"
     } else {
         "ntfs3"
     }
+}
+
+pub(super) fn new_ntfs_driver_available() -> bool {
+    *NEW_NTFS_DRIVER_AVAILABLE.get_or_init(detect_new_ntfs_driver)
+}
+
+fn detect_new_ntfs_driver() -> bool {
+    let release = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    kernel_release_supports_new_ntfs(&release) && kernel_filesystem_available("ntfs")
+}
+
+pub(super) fn kernel_release_supports_new_ntfs(release: &str) -> bool {
+    let mut parts = release.split('.');
+    let major = parts.next().and_then(numeric_prefix);
+    let minor = parts.next().and_then(numeric_prefix);
+    matches!((major, minor), (Some(major), Some(minor)) if (major, minor) >= (7, 1))
+}
+
+fn numeric_prefix(value: &str) -> Option<u64> {
+    let digits = value
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn kernel_filesystem_available(fstype: &str) -> bool {
+    if fs::read_to_string("/proc/filesystems").is_ok_and(|filesystems| {
+        filesystems
+            .lines()
+            .any(|line| line.split_whitespace().last() == Some(fstype))
+    }) {
+        return true;
+    }
+
+    ["/usr/sbin/modprobe", "/sbin/modprobe", "modprobe"]
+        .into_iter()
+        .find(|program| *program == "modprobe" || Path::new(program).is_file())
+        .and_then(|program| {
+            Command::new(program)
+                .args(["--dry-run", "--quiet", fstype])
+                .status()
+                .ok()
+        })
+        .is_some_and(|status| status.success())
 }
 
 pub(super) fn canonical_device_name(dev_path: &str) -> Option<String> {

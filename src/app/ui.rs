@@ -1302,13 +1302,26 @@ pub(super) fn ntfs_driver_line(driver: &str, active: bool) -> Line<'static> {
     } else {
         Span::styled("[ ] ntfs3 (kernel)", available)
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(marker, Style::default().fg(Color::Yellow)),
         Span::styled("NTFS driver: ", Style::default().fg(Color::DarkGray)),
-        ntfs_3g,
-        Span::raw("   "),
-        ntfs3,
-    ])
+    ];
+    if new_ntfs_driver_available() {
+        spans.extend([
+            if driver == "ntfs" {
+                Span::styled("[x] ntfs (kernel 7.1+)", selected)
+            } else {
+                Span::styled("[ ] ntfs (kernel 7.1+)", available)
+            },
+            Span::raw("   "),
+            ntfs3,
+            Span::raw("   "),
+            ntfs_3g,
+        ]);
+    } else {
+        spans.extend([ntfs_3g, Span::raw("   "), ntfs3]);
+    }
+    Line::from(spans)
 }
 
 pub(super) fn editable_form_line(

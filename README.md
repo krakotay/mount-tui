@@ -14,8 +14,9 @@ and unmounting local block devices, SMB/CIFS shares, and SSH filesystems.
   blocking on the device itself.
 - Mounts local filesystems with editable targets and options.
 - Uses desktop-friendly `/media/<user>/<label-or-device>` mount targets by default.
-- Offers an explicit NTFS driver selector: compatible `ntfs-3g` (default) or
-  the in-kernel `ntfs3` driver.
+- Offers an explicit NTFS driver selector. The new in-kernel `ntfs` driver is
+  the default when it is available on Linux 7.1+, with `ntfs3` and compatible
+  `ntfs-3g` alternatives; otherwise the existing `ntfs-3g` default is kept.
 - Connects and reconnects SMB/CIFS shares using an embedded credential form.
 - Reads concrete hosts from the invoking user's `~/.ssh/config` and mounts
   remote directories through SSHFS. Manual `[user@]host` entry is also available.
@@ -41,7 +42,8 @@ and unmounting local block devices, SMB/CIFS shares, and SSH filesystems.
 
 Optional runtime helpers:
 
-- `ntfs-3g` for the default, most compatible NTFS mode
+- `ntfs-3g` for the most compatible NTFS mode and fallback on systems without
+  the new Linux 7.1+ `ntfs` driver
 - `cifs-utils` (`mount.cifs`) for SMB/CIFS shares
 - `sshfs` for SSH filesystems
 
@@ -179,10 +181,13 @@ dialog so mount-tui can be restarted through `sudo`.
 
 ## NTFS drivers
 
-For an NTFS volume, `ntfs-3g` is selected by default for compatibility. Select
-`ntfs3` in the mount form to use the newer in-kernel driver. `ntfs-3g` is a
-userspace FUSE driver and must be installed separately; the program invokes its
-system mount helper when selected.
+For an NTFS volume, the new in-kernel `ntfs` read-write driver is selected by
+default when the running kernel is Linux 7.1 or newer and the driver is built in
+or available as a module. The mount form also offers the older in-kernel
+`ntfs3` driver and the compatible `ntfs-3g` userspace driver. If the new `ntfs`
+driver is unavailable, the selector keeps the previous `ntfs-3g` default and
+`ntfs3` alternative. `ntfs-3g` must be installed separately; the program
+invokes its system mount helper when selected.
 
 ## License
 
